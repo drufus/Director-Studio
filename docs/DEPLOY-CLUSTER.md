@@ -88,7 +88,7 @@ DS_LLM_PROVIDER=openai_compatible
 DS_LLM_BASE_URL=http://100.124.186.11:4000/v1
 DS_LLM_API_KEY=<REDACTED>
 DS_LLM_MODEL=kasari-flash
-DS_LLM_VISION_MODELS=<EXACT_IDS_VERIFIED_BY_AUTHENTICATED_VISION_PROBE>
+DS_LLM_VISION_MODELS=kasari-flash
 DS_DIRECTOR_NUM_PREDICT=8192
 DS_VRAM_POLICY=independent
 DS_H3_PROVIDER=local
@@ -106,7 +106,7 @@ The job record retains submission and execution memory samples, the minimum free
 
 The sampler waits one second after each completed request before the next execution sample; actual cadence includes the HTTP request duration. Each `/system_stats` sampling request has a 30-second timeout. The job retains request start times and durations, so a slow worker is visible as a longer sampling interval. A timeout or failed measurement remains a recorded telemetry error, and the calibration cannot claim complete peak evidence. Submission and final measurements are also retained; this is periodic sampling, not an instantaneous allocator peak.
 
-Set `DS_LLM_VISION_MODELS` only to exact catalog IDs that passed the authenticated image-parts and JSON-schema probe on this router. Do not infer capability from names or substitute an unadvertised vision route. The initial Director model is explicitly `kasari-flash`; a provider-scoped picker selection in the durable data directory takes precedence, and model selection source is recorded in inference usage logs. `DS_VRAM_POLICY=independent` keeps Director chat available during remote renders.
+On 2026-09-08, the authenticated node #6 probe verified image content parts and strict JSON-schema behavior for `kasari-flash`. Neither `kasari-vision` nor `kasari-vision-deep` appeared in the router roster; do not route to their separate physical hosts implicitly. Set `DS_LLM_VISION_MODELS` only to exact catalog IDs that passed the authenticated image-parts and JSON-schema probe on this router. Do not infer capability from names or substitute an unadvertised vision route. The initial Director model is explicitly `kasari-flash`; a provider-scoped picker selection in the durable data directory takes precedence, and model selection source is recorded in inference usage logs. `DS_VRAM_POLICY=independent` keeps Director chat available during remote renders.
 
 Create the private env file with an editor on node #6 using mode `0600`, then have a host-side Python process read the existing router key and write the `DS_LLM_API_KEY` entry in memory. Do not source the file as shell code, display its contents, or copy the key through a terminal. Validate its permissions without reading values:
 
@@ -135,6 +135,8 @@ The env file must exist and both `/usr/bin/ffmpeg` and `/usr/bin/ffprobe` must b
 From the Mac, open `http://100.124.186.11:8790` and verify that the UI loads, the worker panel lists only beastviii, and the active H3 profile carries successful test evidence for its exact worker ID and URL. Verify the model picker with the authenticated router configuration, then run a real Director planning pass. `/api/health/live` checks only this API process. `/api/health` contacts configured workers and the authenticated model catalog, and requires the selected model to appear in that catalog. Check its JSON `ok` value; a returned HTTP 200 alone is insufficient. Neither endpoint runs actual inference or establishes custom workflow, media tool, or completed-render acceptance.
 
 Run the authenticated `/v1/models` and image/schema capability probes from node #6 after deployment, loading the key from its mode-600 env file inside the probe process. Report exact roster IDs and allowlisted capability results only. Record the real `kasari-flash` planning call's 8192-token cap, selection source, reasoning tokens, payload tokens, and whether the request sends `chat_template_kwargs.enable_thinking=false` through the supported extra-body mechanism. A missing server token breakdown is unknown, not zero or an estimate. Do not log raw request headers, credentials, or full env data.
+
+See [dated node #6 acceptance evidence](PHASE-5-CLUSTER-ACCEPTANCE.md) for the authenticated roster, vision results, real planning token split, and remaining administrator steps.
 
 ## Logs, data, and updates
 
