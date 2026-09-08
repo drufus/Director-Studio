@@ -7,6 +7,9 @@ import { JsonProductionPage } from "./JsonProductionPage";
 import { getStoryboard, listJsonShotJobs, putStoryboard, submitJsonShot } from "./api";
 import { cancelH3Job } from "../production/api";
 
+const fetchH3ProfilesMock = vi.hoisted(() => vi.fn());
+vi.mock("../../shared/api/client", async (importOriginal) => ({ ...await importOriginal<typeof import("../../shared/api/client")>(), fetchH3Profiles: fetchH3ProfilesMock }));
+
 const projectState = vi.hoisted(() => ({ projectId: "prj_test" as string | null }));
 
 vi.mock("../../shared/project/ProjectContext", () => ({
@@ -128,6 +131,7 @@ describe("JsonProductionPage import", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    fetchH3ProfilesMock.mockResolvedValue({ active: { profile_id: "builtin-official-h3", source: "builtin" }, profiles: [] });
     projectState.projectId = "prj_test";
     vi.stubGlobal("URL", {
       ...URL,
@@ -253,6 +257,7 @@ describe("JsonProductionPage three-column workspace", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    fetchH3ProfilesMock.mockResolvedValue({ active: { profile_id: "builtin-official-h3", source: "builtin" }, profiles: [] });
     projectState.projectId = "prj_test";
     vi.stubGlobal("URL", {
       ...URL,
@@ -379,6 +384,21 @@ describe("JsonProductionPage three-column workspace", () => {
 
     expect(await screen.findByText(/malformed JSON/i)).toBeTruthy();
     expect(putStoryboard).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing", "no eligible workers"])("blocks JSON generation when the selected custom workflow has %s", async (condition) => {
+    fetchH3ProfilesMock.mockResolvedValue(condition === "missing"
+      ? { active: null, selected_profile_id: "custom-required", active_error: { code: "profile_missing", message: "Custom workflow file missing" }, profiles: [] }
+      : { active: { profile_id: "custom-required", source: "custom", eligible_workers: [] }, profiles: [] });
+    render(<JsonProductionPage active />);
+    fireEvent.click(await screen.findByRole("button", { name: /shot_002/ }));
+    fireEvent.change(screen.getByLabelText("Picture 1 · Actor"), { target: { files: [new File(["picture"], "actor.png", { type: "image/png" })] } });
+    fireEvent.change(screen.getByLabelText("Picture 2 · Layout"), { target: { files: [new File(["layout"], "layout.png", { type: "image/png" })] } });
+    fireEvent.change(screen.getByLabelText(/Audio 1/), { target: { files: [new File(["audio"], "steps.wav", { type: "audio/wav" })] } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    expect(await screen.findByText(/Selected workflow custom-required/)).toBeTruthy();
+    expect(submitJsonShot).not.toHaveBeenCalled();
+    expect(screen.getByText("actor.png")).toBeTruthy();
   });
 
   it("submits selected files in slot order, polls by json_shot_id, and keeps files after completion", async () => {

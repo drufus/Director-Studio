@@ -19,7 +19,6 @@ from app.api import comfy_workers, director, health
 @pytest.fixture
 def jobs(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "jobs_dir", tmp_path / "jobs")
-    monkeypatch.setattr(settings, "comfy_min_free_ram_gib", 8)
     monkeypatch.setattr(settings, "comfy_min_free_vram_gib", 12)
 
 
@@ -153,14 +152,14 @@ async def test_h3_admission_records_measured_numbers_and_thresholds(jobs):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("mode", ["low_ram", "low_vram", "no_stats", "missing", "threshold_unset"])
+@pytest.mark.parametrize("mode", ["low_vram", "no_stats", "missing", "threshold_unset"])
 async def test_h3_admission_fails_loudly_and_persists_snapshot(jobs, monkeypatch, mode):
     registry = make_registry(healthy)
     job = make_job()
     await registry.bind_job(job)
-    payload = stats(ram=1 if mode == "low_ram" else 16, vram=2 if mode == "low_vram" else 24)
+    payload = stats(ram=128, vram=2 if mode == "low_vram" else 24)
     if mode == "missing":
-        payload["system"].pop("ram_free")
+        payload["devices"][0].pop("vram_free")
     if mode == "threshold_unset":
         monkeypatch.setattr(settings, "comfy_min_free_vram_gib", None)
     def handler(request):
@@ -174,7 +173,7 @@ async def test_h3_admission_fails_loudly_and_persists_snapshot(jobs, monkeypatch
     result = load_job(job.id).memory_admission
     assert result["accepted"] is False
     assert result["error"] in str(error.value)
-    if mode in {"low_ram", "low_vram"}:
+    if mode == "low_vram":
         assert "free=" in result["error"] and "required=" in result["error"]
     if mode == "threshold_unset":
         assert "DS_COMFY_MIN_FREE_VRAM_GIB" in result["error"]
@@ -340,3 +339,77 @@ async def test_partial_submission_keeps_accepted_id_when_cleanup_is_interrupted(
         await client.queue_prompt({})
     assert error.value.prompt_id == "partial-interrupted"
     assert "Missing model" in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ram", [0.01, None])
+async def test_h3_low_or_unavailable_ram_never_blocks_sufficient_vram(jobs, monkeypatch, ram):
+    registry = make_registry(healthy)
+    job = make_job(h3_profile_test=True, frames=56)
+    await registry.bind_job(job)
+    payload = stats(ram=0, vram=32)
+    payload["system"]["ram_free"] = ram * 1024**3 if ram is not None else None
+    monkeypatch.setattr(settings, "comfy_memory_threshold_provisional", True)
+    client = ComfyClient(job.worker_url, worker_id=job.worker_id,
+                         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)))
+    await registry.check_h3_admission(job, client)
+    admission = load_job(job.id).memory_admission
+    assert admission["accepted"] is True
+    assert admission["metric"] == "vram_free"
+    assert admission["threshold_provisional"] is True
+    assert "min_free_ram_bytes" not in admission
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [
+    {},
+    {"frames": 56},
+    {"h3_profile_test": False, "frames": 56},
+    {"h3_profile_test": "true", "frames": 56},
+    {"h3_profile_test": True, "frames": 112},
+    {"h3_profile_test": True, "frames": "56"},
+    {"h3_profile_test": True, "frames": 56.0},
+])
+async def test_provisional_threshold_rejects_production_and_noncalibration_jobs_with_snapshot(jobs, monkeypatch, params):
+    monkeypatch.setattr(settings, "comfy_memory_threshold_provisional", True)
+    monkeypatch.setattr(settings, "comfy_min_free_vram_gib", 1)
+    registry = make_registry(healthy)
+    job = make_job(**params)
+    client = await registry.bind_job(job)
+    with pytest.raises(ComfyError, match="only 56-frame profile calibration tests.*production H3 is blocked"):
+        await registry.check_h3_admission(job, client)
+    snapshot = load_job(job.id).memory_admission
+    assert snapshot["accepted"] is False
+    assert snapshot["threshold_provisional"] is True
+    assert snapshot["min_free_vram_bytes"] == 1024**3
+    assert snapshot["devices"][0]["vram_free_bytes"] == 24 * 1024**3
+    assert snapshot["ram_free_bytes"] == 16 * 1024**3
+    assert "DS_COMFY_MEMORY_THRESHOLD_PROVISIONAL=false" in snapshot["error"]
+
+
+@pytest.mark.asyncio
+async def test_provisional_threshold_admits_actual_56_frame_profile_calibration(jobs, monkeypatch):
+    monkeypatch.setattr(settings, "comfy_memory_threshold_provisional", True)
+    monkeypatch.setattr(settings, "comfy_min_free_vram_gib", 1)
+    registry = make_registry(healthy)
+    job = make_job(h3_profile_test=True, frames=56)
+    client = await registry.bind_job(job)
+    await registry.check_h3_admission(job, client)
+    snapshot = load_job(job.id).memory_admission
+    assert snapshot["accepted"] is True
+    assert snapshot["error"] is None
+    assert snapshot["threshold_provisional"] is True
+    assert snapshot["devices"][0]["vram_free_bytes"] == 24 * 1024**3
+
+
+@pytest.mark.asyncio
+async def test_final_operator_threshold_allows_production_h3(jobs, monkeypatch):
+    monkeypatch.setattr(settings, "comfy_memory_threshold_provisional", False)
+    registry = make_registry(healthy)
+    job = make_job(frames=240)
+    client = await registry.bind_job(job)
+    await registry.check_h3_admission(job, client)
+    snapshot = load_job(job.id).memory_admission
+    assert snapshot["accepted"] is True
+    assert snapshot["threshold_provisional"] is False
+    assert snapshot["min_free_vram_bytes"] == 12 * 1024**3

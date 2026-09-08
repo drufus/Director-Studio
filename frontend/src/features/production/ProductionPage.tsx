@@ -28,7 +28,7 @@ import {
 } from "./api";
 import { listLibraryAssets, type LibraryAsset } from "../library/api";
 import { ShotMaterialEditor } from "../director/ShotMaterialEditor";
-import { fetchH3Profiles } from "../../shared/api/client";
+import { fetchH3Profiles, h3ProfileFailure } from "../../shared/api/client";
 import type { H3ActiveProfile } from "../../shared/api/types";
 
 const ACTIVE: JobStatus[] = ["queued", "uploading", "running"];
@@ -44,9 +44,11 @@ function ProductionWorkflowProfile({ profile, error, job }: {
         <>
           <span>{`Render workers · ComfyUI — ${profile.display_name}`}</span>
           <small>{`Workflow: ${profile.display_name}`}</small>
+          {profile.selection_message ? <p>{profile.selection_message}</p> : null}
+          {profile.eligible_workers?.map((worker) => <small key={`${worker.worker_id}:${worker.worker_url}`}>Tested worker: {worker.worker_id} · {worker.worker_url}</small>)}
           {profile.warning ? (
             <div className="banner" role="status">
-              <strong>Using Built-in Official H3</strong>
+              <strong>Workflow notice</strong>
               <span>{profile.warning.message}</span>
             </div>
           ) : null}
@@ -180,19 +182,24 @@ export function ProductionPage({
   const [workflowProfile, setWorkflowProfile] = useState<H3ActiveProfile | null>(null);
   const [workflowProfileError, setWorkflowProfileError] = useState<string | null>(null);
   const profileRequest = useRef(0);
-  const refreshWorkflowProfile = useCallback(async () => {
+  const refreshWorkflowProfile = useCallback(async (required = false) => {
     const request = ++profileRequest.current;
     try {
       const current = await fetchH3Profiles();
+      const failure = h3ProfileFailure(current);
+      if (failure) throw new Error(failure);
       if (request === profileRequest.current) {
         setWorkflowProfile(current.active);
         setWorkflowProfileError(null);
       }
+      return current.active;
     } catch (err) {
       if (request === profileRequest.current) {
         setWorkflowProfile(null);
         setWorkflowProfileError(err instanceof Error ? err.message : String(err));
       }
+      if (required) throw err;
+      return null;
     }
   }, []);
   useEffect(() => {
@@ -427,7 +434,7 @@ export function ProductionPage({
         resolutionPreset === "auto"
           ? undefined
           : RESOLUTION_PRESETS[resolutionPreset];
-      if (h3Provider === "local") await refreshWorkflowProfile();
+      if (h3Provider === "local") await refreshWorkflowProfile(true);
       replaceShot(await submitShot(selected.id, h3Provider, resolution));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

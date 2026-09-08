@@ -31,7 +31,7 @@ class ProfileStateError(ProfileStorageError):
 
 @dataclass(frozen=True)
 class ProfileWarning:
-    """A non-fatal reason that resolution fell back to the official profile."""
+    """A non-fatal profile notice retained for public response compatibility."""
 
     code: str
     message: str

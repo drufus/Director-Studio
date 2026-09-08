@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+from test_h3_profile_store import worker_evidence
 
 from app.config import settings
 from app.core.jobs import runner
@@ -104,24 +105,11 @@ def _install_profile(store: H3ProfileStore, profile_id: str, *, saver_id: str) -
         status="active",
     )
     mapping_sha256 = store.mapping_sha256(profile.mapping)
+    validation, test = worker_evidence(
+        profile.workflow_sha256, mapping_sha256, job_id=f"job_{profile_id}"
+    )
     store.install_profile(
-        profile,
-        graph,
-        validation_record={
-            "valid": True,
-            "contract_version": 2,
-            "workflow_sha256": profile.workflow_sha256,
-            "mapping_sha256": mapping_sha256,
-            "report": {"valid": True},
-            "comfy": {"valid": True},
-        },
-        test_record={
-            "status": "succeeded",
-            "contract_version": 2,
-            "workflow_sha256": profile.workflow_sha256,
-            "mapping_sha256": mapping_sha256,
-            "job_id": f"job_{profile_id}",
-        },
+        profile, graph, validation_record=validation, test_record=test
     )
 
 

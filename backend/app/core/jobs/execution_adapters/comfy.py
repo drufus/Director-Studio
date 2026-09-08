@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ...comfy import ComfyError
+from ...comfy.memory import H3MemorySampler
 from ...schemas import JobRecord, JobStatus
 from .. import store
 
@@ -24,6 +25,7 @@ class ComfyExecutionRuntime:
     finish: Callable[[JobRecord], Awaitable[None]]
     update_phase: Callable[[str, str, str], Awaitable[None]]
     save_completed_outputs: Callable[..., Awaitable[JobRecord]]
+    memory_sampler: Callable[..., H3MemorySampler] = H3MemorySampler
 
 
 class ComfyExecutionAdapter:
@@ -48,6 +50,7 @@ class ComfyExecutionAdapter:
         cancel_event: asyncio.Event,
         runtime: ComfyExecutionRuntime,
     ) -> None:
+        sampler = None
         try:
             if not self.can_replay_job(job):
                 raise ComfyError(
@@ -86,6 +89,9 @@ class ComfyExecutionAdapter:
 
             if job.pipeline_id == "h3_ref2va":
                 await runtime.admit_h3(job, client)
+                sampler = runtime.memory_sampler(job, client)
+                await sampler.start()
+                job = store.load_job(job.id) or job
             self._check_cancelled(cancel_event)
             # Persist before POST: a crash without an ID is ambiguous, never replayable.
             job.status = JobStatus.running
@@ -96,7 +102,7 @@ class ComfyExecutionAdapter:
             job.comfy_prompt_id = prompt_id
             store.save_job(job)
             self._check_cancelled(cancel_event)
-            await self._collect(job, pipeline, client, cancel_event, runtime)
+            await self._collect(job, pipeline, client, cancel_event, runtime, sampler)
         except asyncio.CancelledError:
             if not cancel_event.is_set():
                 # Shutdown/task interruption is not a user cancellation. Preserve
@@ -106,6 +112,13 @@ class ComfyExecutionAdapter:
         except Exception as exc:
             self._mark_failed(job.id, exc)
         finally:
+            if sampler is not None:
+                current = store.load_job(job.id) or job
+                phase = "interrupted" if current.status == JobStatus.running else current.status.value
+                try:
+                    await sampler.finish(phase)
+                except Exception as exc:
+                    self._mark_failed(job.id, exc, stage="Memory measurement finalization failed")
             await self._finalize(job.id, runtime)
 
     async def resume(
@@ -115,6 +128,7 @@ class ComfyExecutionAdapter:
         cancel_event: asyncio.Event,
         runtime: ComfyExecutionRuntime,
     ) -> None:
+        sampler = None
         try:
             if not job.comfy_prompt_id:
                 raise ComfyError("Cannot resume ComfyUI job without its prompt ID")
@@ -125,8 +139,11 @@ class ComfyExecutionAdapter:
             self._check_cancelled(cancel_event)
             client = await runtime.bind_worker(job, allow_selection=False)
             await runtime.prepare(job)
+            if job.pipeline_id == "h3_ref2va":
+                sampler = runtime.memory_sampler(job, client)
+                await sampler.start(resume=True)
             await runtime.update_phase(job.id, job.status.value, "generating")
-            await self._collect(job, pipeline, client, cancel_event, runtime)
+            await self._collect(job, pipeline, client, cancel_event, runtime, sampler)
         except asyncio.CancelledError:
             if not cancel_event.is_set():
                 # Shutdown/task interruption is not a user cancellation. Preserve
@@ -136,6 +153,13 @@ class ComfyExecutionAdapter:
         except Exception as exc:
             self._mark_failed(job.id, exc)
         finally:
+            if sampler is not None:
+                current = store.load_job(job.id) or job
+                phase = "interrupted" if current.status == JobStatus.running else current.status.value
+                try:
+                    await sampler.finish(phase)
+                except Exception as exc:
+                    self._mark_failed(job.id, exc, stage="Memory measurement finalization failed")
             await self._finalize(job.id, runtime)
 
     async def _collect(
@@ -145,12 +169,15 @@ class ComfyExecutionAdapter:
         client: Any,
         cancel_event: asyncio.Event,
         runtime: ComfyExecutionRuntime,
+        sampler: H3MemorySampler | None = None,
     ) -> None:
         history = await client.wait_for_completion(
             job.comfy_prompt_id,
             cancel_event=cancel_event,
         )
         self._check_cancelled(cancel_event)
+        if sampler is not None:
+            await sampler.finish("completed")
         await runtime.update_phase(job.id, job.status.value, "saving")
         await runtime.save_completed_outputs(
             job.id,
@@ -158,6 +185,7 @@ class ComfyExecutionAdapter:
             client=client,
             history=history,
             cancel_event=cancel_event,
+            **({"completion_check": sampler.require_complete} if sampler is not None else {}),
         )
 
     async def cancel(self, job: JobRecord, runtime: ComfyExecutionRuntime) -> None:

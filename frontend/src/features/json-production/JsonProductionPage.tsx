@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { EMPTY_PROMPT_SECTIONS, type JobStatus, type PromptSections } from "../../shared/api/types";
+import { fetchH3Profiles, h3ProfileFailure } from "../../shared/api/client";
 import { PageShell } from "../../shared/components/PageShell";
 import { useProject } from "../../shared/project/ProjectContext";
 import { cancelH3Job } from "../production/api";
@@ -374,6 +375,9 @@ export function JsonProductionPage({ active = true }: { active?: boolean } = {})
     setError(null);
     setBusy(true);
     try {
+      const currentWorkflow = await fetchH3Profiles();
+      const workflowFailure = h3ProfileFailure(currentWorkflow);
+      if (workflowFailure) throw new Error(workflowFailure);
       const job = await submitJsonShot(projectId, selected.id, storyboard.revision, files);
       setJobsByShotId((prev) => {
         const next = new Map(prev);

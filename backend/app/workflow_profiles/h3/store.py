@@ -9,6 +9,7 @@ import re
 import secrets
 import stat
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -21,13 +22,13 @@ from .errors import (
     ProfileChangedError,
     ProfileStateError,
     ProfileStorageError,
-    ProfileWarning,
 )
 from .models import (
     H3BoundaryMapping,
     H3InputMapping,
     H3OutputSelection,
     H3WorkflowProfile,
+    H3WorkerBinding,
     ResolvedH3Profile,
 )
 
@@ -45,6 +46,9 @@ _OUTPUT_FILE = "output.json"
 _VALIDATION_FILE = "validation.json"
 _TEST_FILE = "test.json"
 _IMPORT_FILE = "import.json"
+_WORKER_FILE = "worker.json"
+_INSPECTION_FILE = "inspection.json"
+_PROOFS_FILE = "worker_proofs.json"
 _JOB_SNAPSHOT_DIR = "workflow_profile"
 _H3_REF2AV_NODE = "MiniMaxH3ReferenceToVideo"
 _H3_I2V_NODE = "MiniMaxH3ImageToVideo"
@@ -107,6 +111,178 @@ class H3ProfileStore:
     ) -> tuple[dict[str, Any], str]:
         """Load graph and digest from the same immutable byte snapshot."""
         return self._read_workflow(self.import_workflow_path(import_id))
+
+    def bind_import_worker(
+        self, import_id: str, binding: H3WorkerBinding | None
+    ) -> H3WorkerBinding | None:
+        """Explicitly choose or clear a worker, invalidating all worker evidence."""
+        directory = self._require_existing_import(import_id)
+        current_record = self._optional_record(directory / _WORKER_FILE)
+        current = self._binding_from_record(current_record, required=False)
+        if current == binding and isinstance(
+            (current_record or {}).get("binding_generation"), str
+        ):
+            return binding
+        # Persist the new identity first. Even an interrupted invalidation makes
+        # old evidence fail its worker comparison.
+        self._atomic_write_json(
+            directory / _WORKER_FILE,
+            {
+                "worker": binding.model_dump(mode="json") if binding else None,
+                "binding_generation": secrets.token_hex(16),
+                "invalidation_reason": "Render worker changed; inspect, validate, and test again",
+            },
+        )
+        self._invalidate_records(
+            directory, (_INSPECTION_FILE, _VALIDATION_FILE, _TEST_FILE)
+        )
+        return binding
+
+    def require_import_worker(
+        self, import_id: str, binding: H3WorkerBinding | None = None
+    ) -> H3WorkerBinding:
+        record = self._optional_record(
+            self._require_existing_import(import_id) / _WORKER_FILE
+        )
+        current = self._binding_from_record(record)
+        if binding is not None and current != binding:
+            raise ProfileStateError(
+                "worker_mismatch",
+                "Import render worker changed; repeat the operation on its selected worker",
+                details={
+                    "import_id": import_id,
+                    "expected_worker": current.model_dump(mode="json"),
+                    "requested_worker": binding.model_dump(mode="json"),
+                },
+            )
+        return current
+
+    def import_binding_generation(self, import_id: str) -> str:
+        record = self._optional_record(
+            self._require_existing_import(import_id) / _WORKER_FILE
+        )
+        generation = (record or {}).get("binding_generation")
+        if not isinstance(generation, str) or not re.fullmatch(
+            r"[0-9a-f]{32}", generation
+        ):
+            raise ProfileStateError(
+                "worker_binding_changed",
+                "Select the render worker again; its binding generation is unavailable",
+            )
+        return generation
+
+    @staticmethod
+    def _binding_from_record(
+        record: dict[str, Any] | None, *, required: bool = True
+    ) -> H3WorkerBinding | None:
+        value = (record or {}).get("worker")
+        if value is None and not required:
+            return None
+        if value is None:
+            raise ProfileStateError(
+                "worker_required",
+                "Select a render worker; worker-bound H3 evidence is required",
+            )
+        try:
+            return H3WorkerBinding.model_validate(value)
+        except (ValidationError, ValueError) as exc:
+            raise ProfileStorageError(
+                "Stored H3 render worker binding is invalid"
+            ) from exc
+
+    def _invalidate_records(self, directory: Path, names: tuple[str, ...]) -> None:
+        for name in names:
+            try:
+                self._safe_path(directory / name, write=True).unlink(missing_ok=True)
+            except OSError as exc:
+                raise ProfileStorageError(
+                    "Could not invalidate stale worker evidence"
+                ) from exc
+
+    def record_inspection(
+        self,
+        import_id: str,
+        binding: H3WorkerBinding,
+        *,
+        workflow_sha256: str,
+        metadata_sha256: str,
+        expected_binding_generation: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_import_worker(import_id, binding)
+        if (
+            expected_binding_generation is not None
+            and expected_binding_generation != self.import_binding_generation(import_id)
+        ):
+            raise ProfileChangedError(
+                "Render worker binding changed during inspection; inspect again"
+            )
+        if self.import_workflow_sha256(import_id) != workflow_sha256:
+            raise ProfileChangedError("Imported workflow changed during inspection")
+        if not isinstance(metadata_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", metadata_sha256
+        ):
+            raise ProfileStorageError("Worker metadata digest is invalid")
+        directory = self._require_existing_import(import_id)
+        generation = self.import_binding_generation(import_id)
+        record = {
+            "worker": binding.model_dump(mode="json"),
+            "binding_generation": generation,
+            "workflow_sha256": workflow_sha256,
+            "metadata_sha256": metadata_sha256,
+            "inspected_at": datetime.now(UTC).isoformat(),
+        }
+        previous = self._optional_record(directory / _INSPECTION_FILE)
+        changed = previous is not None and any(
+            previous.get(key) != record[key]
+            for key in (
+                "worker",
+                "binding_generation",
+                "workflow_sha256",
+                "metadata_sha256",
+            )
+        )
+        self._atomic_write_json(directory / _INSPECTION_FILE, record)
+        if changed:
+            self._invalidate_records(directory, (_VALIDATION_FILE, _TEST_FILE))
+        self._atomic_write_json(
+            directory / _WORKER_FILE,
+            {
+                "worker": binding.model_dump(mode="json"),
+                "binding_generation": generation,
+                "invalidation_reason": "Worker metadata changed; validate and test again"
+                if changed
+                else None,
+            },
+        )
+        return record
+
+    def _require_current_inspection(
+        self, import_id: str, worker: H3WorkerBinding, workflow_sha256: str
+    ) -> dict[str, Any]:
+        self.require_import_worker(import_id, worker)
+        inspection = self._optional_record(
+            self._require_existing_import(import_id) / _INSPECTION_FILE
+        )
+        if inspection is None:
+            raise ProfileStateError(
+                "inspection_required",
+                "Inspect this workflow on its selected render worker first",
+            )
+        metadata = inspection.get("metadata_sha256")
+        if not isinstance(metadata, str) or not re.fullmatch(r"[0-9a-f]{64}", metadata):
+            raise ProfileStorageError(
+                "Stored worker inspection metadata digest is invalid"
+            )
+        if (
+            self._binding_from_record(inspection) != worker
+            or inspection.get("binding_generation")
+            != self.import_binding_generation(import_id)
+            or inspection.get("workflow_sha256") != workflow_sha256
+        ):
+            raise ProfileChangedError(
+                "Workflow inspection no longer matches the workflow and selected worker"
+            )
+        return inspection
 
     def save_import_output(self, import_id: str, node_id: str) -> None:
         """Persist an output choice and invalidate dependent mapping evidence."""
@@ -213,8 +389,17 @@ class H3ProfileStore:
         mapping_sha256: str,
         report: dict[str, Any],
         comfy_payload: dict[str, Any],
+        worker: H3WorkerBinding,
+        expected_binding_generation: str | None = None,
     ) -> dict[str, Any]:
         """Persist successful contract and live-Comfy validation evidence."""
+        if (
+            expected_binding_generation is not None
+            and expected_binding_generation != self.import_binding_generation(import_id)
+        ):
+            raise ProfileChangedError(
+                "Render worker binding changed during validation; validate again"
+            )
         current_workflow_sha256, current_mapping_sha256 = self.import_identity(
             import_id
         )
@@ -225,7 +410,17 @@ class H3ProfileStore:
             raise ProfileChangedError(
                 "Imported workflow or mapping changed during validation"
             )
+        inspection = self._require_current_inspection(
+            import_id, worker, workflow_sha256
+        )
+        if comfy_payload.get("metadata_sha256") != inspection.get("metadata_sha256"):
+            raise ProfileStateError(
+                "inspection_changed",
+                "Worker metadata changed since inspection; inspect again before validation",
+            )
         record = {
+            "worker": worker.model_dump(mode="json"),
+            "inspection": inspection,
             "valid": True,
             "contract_version": 2,
             "workflow_sha256": workflow_sha256,
@@ -255,6 +450,81 @@ class H3ProfileStore:
             mapping_sha256=mapping_sha256,
         )
         return workflow_sha256, mapping_sha256
+
+    def record_test_submission(self, import_id: str, job: JobRecord) -> dict[str, Any]:
+        """Record a test intent before its background task or snapshot can start."""
+        worker = self.require_import_worker(import_id)
+        workflow_hash, mapping_hash = self.testable_import_identity(import_id)
+        self._require_test_intent(job, import_id, worker, workflow_hash, mapping_hash)
+        inspection = self._require_current_inspection(import_id, worker, workflow_hash)
+        self._capture_test_inspection(job, inspection)
+        from app.core.jobs.store import save_job
+
+        save_job(job)
+        record = {
+            "status": "submitted",
+            "binding_generation": inspection["binding_generation"],
+            "metadata_sha256": inspection["metadata_sha256"],
+            "contract_version": 2,
+            "worker": worker.model_dump(mode="json"),
+            "workflow_sha256": workflow_hash,
+            "mapping_sha256": mapping_hash,
+            "boundary_sha256": self.boundary_sha256(
+                self.load_import_mapping(import_id)
+            ),
+            "job_id": job.id,
+            "submitted_at": datetime.now(UTC).isoformat(),
+        }
+        self._atomic_write_json(
+            self._require_existing_import(import_id) / _TEST_FILE, record
+        )
+        return record
+
+    @staticmethod
+    def _capture_test_inspection(job: JobRecord, inspection: dict[str, Any]) -> None:
+        params = dict(job.params or {})
+        for field in ("binding_generation", "metadata_sha256"):
+            key = f"h3_profile_test_{field}"
+            if key in params and params[key] != inspection[field]:
+                raise ProfileChangedError(
+                    "H3 test belongs to an earlier worker binding or metadata inspection; submit a new test"
+                )
+            params[key] = inspection[field]
+        job.params = params
+
+    def _require_test_intent(
+        self,
+        job: JobRecord,
+        import_id: str,
+        worker: H3WorkerBinding,
+        workflow_hash: str,
+        mapping_hash: str,
+    ) -> None:
+        self._require_job_worker(job, worker, durable=False)
+        params = job.params or {}
+        inspection = self._require_current_inspection(import_id, worker, workflow_hash)
+        for field in ("binding_generation", "metadata_sha256"):
+            key = f"h3_profile_test_{field}"
+            if key in params and params[key] != inspection[field]:
+                raise ProfileChangedError(
+                    "Pending H3 test belongs to an earlier worker binding or metadata inspection"
+                )
+        if (
+            job.pipeline_id != "h3_ref2va"
+            or params.get("h3_profile_test") is not True
+            or params.get("h3_profile_import_id") != import_id
+            or params.get("h3_profile_test_workflow_sha256") != workflow_hash
+            or params.get("h3_profile_test_mapping_sha256") != mapping_hash
+            or params.get("h3_profile_test_boundary_sha256")
+            != self.boundary_sha256(self.load_import_mapping(import_id))
+            or job.project_id is not None
+            or job.library_asset_id is not None
+            or "shot_id" in params
+            or "project_id" in params
+        ):
+            raise ProfileChangedError(
+                "H3 test intent does not match its import identity and worker"
+            )
 
     def record_test_success(
         self,
@@ -288,11 +558,24 @@ class H3ProfileStore:
             boundary_sha256=boundary_sha256,
             job_id=job_id,
         )
+        worker = self.require_import_worker(import_id)
+        self._require_current_validation(
+            directory,
+            import_id=import_id,
+            workflow_sha256=workflow_sha256,
+            mapping_sha256=mapping_sha256,
+        )
+        inspection = self._require_current_inspection(
+            import_id, worker, workflow_sha256
+        )
         candidates = self._test_video_candidates(job)
         if artifact_index is None and len(candidates) == 1:
             artifact_index = 0
         if artifact_index is None:
             record = {
+                "worker": worker.model_dump(mode="json"),
+                "metadata_sha256": inspection["metadata_sha256"],
+                "binding_generation": inspection["binding_generation"],
                 "status": "awaiting_selection",
                 "contract_version": 2,
                 "workflow_sha256": workflow_sha256,
@@ -319,6 +602,9 @@ class H3ProfileStore:
                 "Imported workflow or mapping changed during test execution"
             )
         record = {
+            "worker": worker.model_dump(mode="json"),
+            "metadata_sha256": inspection["metadata_sha256"],
+            "binding_generation": inspection["binding_generation"],
             "status": "succeeded",
             "contract_version": 2,
             "workflow_sha256": workflow_sha256,
@@ -341,6 +627,10 @@ class H3ProfileStore:
                 "test_output_required",
                 "No completed H3 workflow test is awaiting output selection",
                 details={"import_id": import_id},
+            )
+        if self._binding_from_record(pending) != self.require_import_worker(import_id):
+            raise ProfileChangedError(
+                "Test output evidence belongs to a different render worker"
             )
         return self.record_test_success(
             import_id,
@@ -376,6 +666,12 @@ class H3ProfileStore:
                 "test_required",
                 "A successful test for this workflow is required before activation",
                 details={"import_id": import_id},
+            )
+        if self._binding_from_record(test_record) != self.require_import_worker(
+            import_id
+        ):
+            raise ProfileChangedError(
+                "Successful test belongs to a different render worker"
             )
         if test_record.get("contract_version") != 2:
             raise ProfileStateError(
@@ -446,7 +742,9 @@ class H3ProfileStore:
                 "Imported workflow or mapping changed during activation"
             )
         self.select_profile(profile_id)
-        return profile
+        return H3WorkflowProfile.model_validate(
+            self._read_json(self.profile_path(profile_id))
+        )
 
     def list_installed_profiles(self) -> list[H3WorkflowProfile]:
         """Return valid installed custom profile metadata in stable ID order."""
@@ -515,7 +813,17 @@ class H3ProfileStore:
         workflow_sha256 = self.import_workflow_sha256(import_id)
         mapping = self.load_import_mapping(import_id)
         mapping_sha256 = self.mapping_sha256(mapping) if mapping else None
+        directory = self._require_existing_import(import_id)
+        worker_record = self._optional_record(directory / _WORKER_FILE)
+        worker = self._binding_from_record(worker_record, required=False)
+        inspection = self._optional_record(directory / _INSPECTION_FILE)
         result: dict[str, Any] = {
+            "worker": worker.model_dump(mode="json") if worker else None,
+            "inspected_at": inspection.get("inspected_at") if inspection else None,
+            "metadata_sha256": inspection.get("metadata_sha256")
+            if inspection
+            else None,
+            "invalidation_reason": (worker_record or {}).get("invalidation_reason"),
             "status": "mapped" if mapping else "draft",
             "workflow_sha256": workflow_sha256,
             "mapping_sha256": mapping_sha256,
@@ -532,11 +840,57 @@ class H3ProfileStore:
                 workflow_sha256=workflow_sha256,
                 mapping_sha256=mapping_sha256,
             )
-        except ProfileStorageError:
+        except ProfileStorageError as exc:
+            if self._optional_record(directory / _VALIDATION_FILE) is not None:
+                result["invalidation_reason"] = str(exc)
             return result
         result.update(status="validated", validated_at=validation.get("validated_at"))
         try:
             test = self._optional_record(directory / _TEST_FILE)
+            if test and test.get("status") in {"submitted", "awaiting_selection"}:
+                from app.core.jobs.store import job_dir
+                from app.core.schemas import JobRecord
+
+                job_id = test.get("job_id")
+                if not isinstance(job_id, str) or not re.fullmatch(
+                    r"job_[a-f0-9]{12}", job_id
+                ):
+                    raise ProfileStorageError(
+                        "Pending H3 workflow test job ID is invalid"
+                    )
+                if (
+                    test.get("contract_version") != 2
+                    or self._binding_from_record(test) != worker
+                    or test.get("workflow_sha256") != workflow_sha256
+                    or test.get("mapping_sha256") != mapping_sha256
+                ):
+                    raise ProfileChangedError(
+                        "Pending H3 test no longer matches its workflow and selected worker"
+                    )
+                try:
+                    pending_job = JobRecord.model_validate(
+                        self._read_json(job_dir(job_id) / "job.json")
+                    )
+                except ValidationError as exc:
+                    raise ProfileStorageError(
+                        "Pending H3 workflow test job is invalid"
+                    ) from exc
+                self._require_test_intent(
+                    pending_job, import_id, worker, workflow_sha256, mapping_sha256
+                )
+                if test.get("status") == "awaiting_selection":
+                    self._require_successful_test_job(
+                        import_id=import_id,
+                        workflow_sha256=workflow_sha256,
+                        mapping_sha256=mapping_sha256,
+                        boundary_sha256=test.get("boundary_sha256"),
+                        job_id=job_id,
+                    )
+                return {
+                    **result,
+                    "test_job_id": job_id,
+                    "test_status": pending_job.status.value,
+                }
             if not test or (
                 test.get("status") != "succeeded"
                 or test.get("contract_version") != 2
@@ -544,6 +898,10 @@ class H3ProfileStore:
                 or test.get("mapping_sha256") != mapping_sha256
             ):
                 return result
+            if self._binding_from_record(test) != worker:
+                raise ProfileChangedError(
+                    "Test evidence belongs to a different render worker"
+                )
             self._require_successful_test_job(
                 import_id=import_id,
                 workflow_sha256=workflow_sha256,
@@ -553,7 +911,8 @@ class H3ProfileStore:
             )
             if self.import_identity(import_id) != (workflow_sha256, mapping_sha256):
                 return {**result, "status": "mapped", "validated_at": None}
-        except ProfileStorageError:
+        except ProfileStorageError as exc:
+            result["invalidation_reason"] = str(exc)
             return result
         result.update(status="tested", test_job_id=test["job_id"])
         return result
@@ -607,6 +966,27 @@ class H3ProfileStore:
             raise ProfileChangedError(
                 "Imported workflow or mapping changed after validation"
             )
+        worker = self.require_import_worker(import_id)
+        inspection = self._require_current_inspection(
+            import_id, worker, workflow_sha256
+        )
+        validation_inspection = validation.get("inspection")
+        if not isinstance(validation_inspection, dict):
+            raise ProfileStorageError(
+                "Stored validation has no worker inspection evidence"
+            )
+        if (
+            self._binding_from_record(validation) != worker
+            or self._binding_from_record(validation_inspection) != worker
+            or validation_inspection.get("workflow_sha256") != workflow_sha256
+            or validation_inspection.get("binding_generation")
+            != inspection.get("binding_generation")
+            or validation_inspection.get("metadata_sha256")
+            != inspection.get("metadata_sha256")
+        ):
+            raise ProfileChangedError(
+                "Validation no longer matches its selected worker and inspected metadata"
+            )
         report = validation.get("report")
         comfy = validation.get("comfy")
         if (
@@ -614,6 +994,7 @@ class H3ProfileStore:
             or report.get("valid") is not True
             or not isinstance(comfy, dict)
             or comfy.get("valid") is not True
+            or comfy.get("metadata_sha256") != inspection.get("metadata_sha256")
         ):
             raise ProfileStateError(
                 "validation_required",
@@ -652,6 +1033,8 @@ class H3ProfileStore:
                 "The referenced H3 profile test job did not succeed",
                 details={"import_id": import_id, "job_id": job_id},
             )
+        worker = self.require_import_worker(import_id)
+        self._require_job_worker(job, worker, durable=True)
         params = job.params or {}
         if (
             job.id != job_id
@@ -694,7 +1077,8 @@ class H3ProfileStore:
                 details={"import_id": import_id, "job_id": job_id},
             ) from exc
         if (
-            snapshot.profile_id != import_id
+            snapshot.eligible_workers != (worker,)
+            or snapshot.profile_id != import_id
             or snapshot.workflow_sha256 != workflow_sha256
             or (
                 boundary_sha256 is None
@@ -709,6 +1093,18 @@ class H3ProfileStore:
                 "H3 profile test job snapshot does not match its evidence"
             )
 
+        inspection = self._require_current_inspection(
+            import_id, worker, workflow_sha256
+        )
+        snapshot_inspection = snapshot.worker_proofs[0].get("inspection", {})
+        for field in ("metadata_sha256", "binding_generation"):
+            if (
+                snapshot_inspection.get(field) != inspection[field]
+                or params.get(f"h3_profile_test_{field}") != inspection[field]
+            ):
+                raise ProfileChangedError(
+                    "H3 profile test used an earlier worker binding or metadata inspection; a new test is required"
+                )
         candidates = self._test_video_candidates(job)
         if not candidates:
             raise ProfileStateError(
@@ -719,7 +1115,7 @@ class H3ProfileStore:
         return job
 
     def _test_video_candidates(self, job: JobRecord) -> list[dict[str, Any]]:
-        """Return durable test videos in MCP-observed artifact order."""
+        """Return durable test videos in worker-observed artifact order."""
         from app.core.jobs.store import job_dir
 
         candidates: list[dict[str, Any]] = []
@@ -777,26 +1173,109 @@ class H3ProfileStore:
             raise ProfileChangedError(
                 "Profile workflow hash does not match supplied workflow"
             )
-        directory = self._profile_dir(profile_id)
-        self._mkdir(directory)
-        self._atomic_write_bytes(directory / _WORKFLOW_FILE, workflow_bytes)
-        self._atomic_write_json(
-            directory / _PROFILE_FILE,
-            profile.model_dump(mode="json"),
-        )
         if (validation_record is None) != (test_record is None):
             raise ProfileStorageError(
                 "Installed validation and test evidence must be supplied together"
             )
+        directory = self._profile_dir(profile_id)
+        proofs: list[dict[str, Any]] = []
         if validation_record is not None and test_record is not None:
-            self._atomic_write_json(
-                directory / _VALIDATION_FILE,
-                {
-                    **validation_record,
-                    "test": test_record,
-                    "profile_sha256": self._profile_sha256(profile),
-                },
+            incoming = {**validation_record, "test": test_record}
+            worker = self._validate_worker_proof(
+                incoming,
+                workflow_sha256=actual_hash,
+                mapping_sha256=self.mapping_sha256(profile.mapping),
             )
+            if self.profile_path(profile_id).exists():
+                existing = self._resolve_custom(profile_id)
+                if (
+                    existing.workflow_sha256 != actual_hash
+                    or existing.mapping != profile.mapping
+                ):
+                    raise ProfileChangedError(
+                        "Cannot replace an installed profile with different graph or mapping bytes"
+                    )
+                proofs = [
+                    proof
+                    for proof in existing.worker_proofs
+                    if self._binding_from_record(proof) != worker
+                ]
+            proofs.append(incoming)
+            bindings = tuple(self._binding_from_record(proof) for proof in proofs)
+            # A reused ID at a new URL is another exact proof, never an alias.
+            profile = profile.model_copy(update={"eligible_workers": bindings})
+            for proof in proofs:
+                proof["profile_sha256"] = self._profile_sha256(profile)
+        elif profile.eligible_workers:
+            raise ProfileStorageError(
+                "Worker eligibility requires matching validation and test evidence"
+            )
+        self._mkdir(directory)
+        self._atomic_write_bytes(directory / _WORKFLOW_FILE, workflow_bytes)
+        self._atomic_write_json(
+            directory / _PROFILE_FILE, profile.model_dump(mode="json")
+        )
+        if proofs:
+            self._atomic_write_json(
+                directory / _VALIDATION_FILE, {**proofs[-1], "worker_proofs": proofs}
+            )
+
+    def _validate_worker_proof(
+        self, proof: dict[str, Any], *, workflow_sha256: str, mapping_sha256: str
+    ) -> H3WorkerBinding:
+        worker = self._binding_from_record(proof)
+        test = proof.get("test")
+        inspection = proof.get("inspection")
+        report = proof.get("report")
+        comfy = proof.get("comfy")
+        if (
+            proof.get("valid") is not True
+            or proof.get("contract_version") != 2
+            or not isinstance(report, dict)
+            or report.get("valid") is not True
+            or not isinstance(comfy, dict)
+            or comfy.get("valid") is not True
+            or not isinstance(test, dict)
+            or test.get("status") != "succeeded"
+            or test.get("contract_version") != 2
+            or not isinstance(test.get("job_id"), str)
+            or not test["job_id"]
+            or not isinstance(inspection, dict)
+        ):
+            raise ProfileStorageError(
+                "Custom profile requires durable worker validation and test evidence"
+            )
+        if (
+            self._binding_from_record(test) != worker
+            or self._binding_from_record(inspection) != worker
+        ):
+            raise ProfileChangedError(
+                "Installed profile inspection, validation, and test have different workers"
+            )
+        metadata_hash = inspection.get("metadata_sha256")
+        if (
+            not isinstance(metadata_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", metadata_hash)
+            or comfy.get("metadata_sha256") != metadata_hash
+            or test.get("metadata_sha256") != metadata_hash
+            or not isinstance(inspection.get("binding_generation"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", inspection["binding_generation"])
+            or test.get("binding_generation") != inspection["binding_generation"]
+        ):
+            raise ProfileChangedError(
+                "Installed validation no longer matches its inspected worker metadata"
+            )
+        if (
+            proof.get("workflow_sha256") != workflow_sha256
+            or proof.get("mapping_sha256") != mapping_sha256
+            or inspection.get("workflow_sha256") != workflow_sha256
+            or test.get("workflow_sha256") != workflow_sha256
+            or test.get("mapping_sha256") != mapping_sha256
+        ):
+            raise ProfileChangedError(
+                "Stored profile differs from its validation and test evidence"
+            )
+        return worker
 
     def select_profile(self, profile_id: str) -> None:
         """Atomically point future jobs at the requested verified profile."""
@@ -815,12 +1294,18 @@ class H3ProfileStore:
         )
 
     def resolve_active(self) -> ResolvedH3Profile:
-        """Resolve a valid active profile, otherwise safely use the official graph."""
+        """Honor a saved selection exactly; only a fresh store uses the builtin."""
+        requested: object = "unreadable active pointer"
         try:
             if not self._safe_path(self.active_path).exists():
-                return self._resolve_builtin()
+                return replace(
+                    self._resolve_builtin(),
+                    selection_source="initial_default",
+                    selection_message="No workflow has been selected. The shipped Built-in Official H3 is the initial default.",
+                )
             pointer = self._read_json(self.active_path)
-            profile_id = self._require_profile_id(pointer.get("profile_id"))
+            requested = pointer.get("profile_id")
+            profile_id = self._require_profile_id(requested)
             expected_hash = pointer.get("workflow_sha256")
             if not isinstance(expected_hash, str) or not re.fullmatch(
                 r"[0-9a-f]{64}", expected_hash
@@ -828,20 +1313,18 @@ class H3ProfileStore:
                 raise ProfileStorageError(
                     "Active profile pointer has an invalid workflow hash"
                 )
-            resolved = (
-                self._resolve_builtin()
-                if profile_id == _BUILTIN_PROFILE_ID
-                else self._resolve_custom(profile_id)
-            )
+            resolved = self.resolve_profile(profile_id)
             if resolved.workflow_sha256 != expected_hash:
                 raise ProfileChangedError(
                     "Active profile hash no longer matches its pointer"
                 )
             return resolved
-        except ProfileChangedError as exc:
-            return self._fallback("profile_changed", str(exc))
         except (ProfileStorageError, ValidationError, OSError, TypeError) as exc:
-            return self._fallback("profile_unavailable", str(exc))
+            raise ProfileStateError(
+                "selected_profile_unavailable",
+                f"Selected H3 profile {requested!r} is unavailable: {exc}",
+                details={"profile_id": requested},
+            ) from exc
 
     def resolve_builtin(self) -> ResolvedH3Profile:
         """Resolve the packaged profile for setup/status responses."""
@@ -870,7 +1353,9 @@ class H3ProfileStore:
         if self._safe_path(snapshot_dir).exists() or identity_keys.intersection(params):
             snapshot = self.load_job_snapshot(job.id)
             if (
-                params.get("h3_profile_id") != snapshot.profile_id
+                params.get("h3_eligible_workers")
+                != [w.model_dump(mode="json") for w in snapshot.eligible_workers]
+                or params.get("h3_profile_id") != snapshot.profile_id
                 or params.get("h3_profile_sha256") != snapshot.workflow_sha256
                 or params.get("h3_contract_version") != 2
             ):
@@ -879,6 +1364,7 @@ class H3ProfileStore:
                 )
             return snapshot
 
+        self._require_presubmit_job(job)
         resolved = self.resolve_active()
         if resolved.source == "builtin":
             workflow_path = Path(settings.workflows_dir) / "h3_ref2va.api.json"
@@ -910,6 +1396,7 @@ class H3ProfileStore:
                 source_profile.id != resolved.profile_id
                 or source_profile.workflow_sha256 != resolved.workflow_sha256
                 or source_profile.mapping != resolved.mapping
+                or source_profile.eligible_workers != resolved.eligible_workers
             ):
                 raise ProfileChangedError(
                     "Active profile metadata changed while snapshotting the job"
@@ -928,9 +1415,21 @@ class H3ProfileStore:
 
         self._atomic_write_bytes(snapshot_dir / _WORKFLOW_FILE, workflow_bytes)
         self._atomic_write_bytes(snapshot_dir / _PROFILE_FILE, profile_bytes)
+        self._atomic_write_json(
+            snapshot_dir / _PROOFS_FILE,
+            {
+                "workers": [
+                    w.model_dump(mode="json") for w in resolved.eligible_workers
+                ],
+                "proofs": list(resolved.worker_proofs),
+            },
+        )
         job.params = dict(job.params or {})
         job.params.update(
             {
+                "h3_eligible_workers": [
+                    w.model_dump(mode="json") for w in resolved.eligible_workers
+                ],
                 "h3_profile_id": resolved.profile_id,
                 "h3_profile_sha256": resolved.workflow_sha256,
                 "h3_contract_version": 2,
@@ -946,6 +1445,8 @@ class H3ProfileStore:
         import_id = params.get("h3_profile_import_id")
         if not isinstance(import_id, str):
             raise ProfileStorageError("H3 profile test job has no import ID")
+        worker = self.require_import_worker(import_id)
+        self._require_job_worker(job, worker, durable=False)
         expected_workflow_sha256 = params.get("h3_profile_test_workflow_sha256")
         expected_mapping_sha256 = params.get("h3_profile_test_mapping_sha256")
         if not isinstance(expected_workflow_sha256, str) or not isinstance(
@@ -965,12 +1466,26 @@ class H3ProfileStore:
                 params.get("h3_profile_id") != import_id
                 or params.get("h3_profile_sha256") != expected_workflow_sha256
                 or params.get("h3_contract_version") != 2
+                or snapshot.eligible_workers != (worker,)
+                or params.get("h3_eligible_workers") != [worker.model_dump(mode="json")]
                 or snapshot.profile_id != import_id
                 or snapshot.workflow_sha256 != expected_workflow_sha256
                 or self.mapping_sha256(snapshot.mapping) != expected_mapping_sha256
             ):
                 raise ProfileChangedError(
                     "Test job profile snapshot identity does not match its job record"
+                )
+            inspection = self._require_current_inspection(
+                import_id, worker, expected_workflow_sha256
+            )
+            self._capture_test_inspection(job, inspection)
+            snapshot_inspection = snapshot.worker_proofs[0].get("inspection", {})
+            if any(
+                snapshot_inspection.get(field) != inspection[field]
+                for field in ("binding_generation", "metadata_sha256")
+            ):
+                raise ProfileChangedError(
+                    "Test snapshot belongs to an earlier worker binding or metadata inspection"
                 )
             return snapshot
 
@@ -997,18 +1512,25 @@ class H3ProfileStore:
             workflow_sha256=workflow_sha256,
             mapping_sha256=mapping_sha256,
         )
+        inspection = self._require_current_inspection(
+            import_id, worker, workflow_sha256
+        )
+        self._capture_test_inspection(job, inspection)
+        params = job.params
         self._assert_profile_boundary(workflow, mapping)
         profile = H3WorkflowProfile(
             id=import_id,
             workflow_sha256=workflow_sha256,
             mapping=mapping,
             status="validated",
+            eligible_workers=(worker,),
         )
 
         if self.import_identity(import_id) != (workflow_sha256, mapping_sha256):
             raise ProfileChangedError(
                 "Imported workflow or mapping changed before test snapshot"
             )
+        self._require_presubmit_job(job)
         self._atomic_write_bytes(
             snapshot_dir / _WORKFLOW_FILE,
             self._json_bytes(workflow),
@@ -1017,9 +1539,24 @@ class H3ProfileStore:
             snapshot_dir / _PROFILE_FILE,
             profile.model_dump(mode="json"),
         )
+        self._atomic_write_json(
+            snapshot_dir / _PROOFS_FILE,
+            {
+                "workers": [worker.model_dump(mode="json")],
+                "proofs": [
+                    self._require_current_validation(
+                        directory,
+                        import_id=import_id,
+                        workflow_sha256=workflow_sha256,
+                        mapping_sha256=mapping_sha256,
+                    )
+                ],
+            },
+        )
         job.params = dict(params)
         job.params.update(
             {
+                "h3_eligible_workers": [worker.model_dump(mode="json")],
                 "h3_profile_id": import_id,
                 "h3_profile_sha256": workflow_sha256,
                 "h3_contract_version": 2,
@@ -1031,6 +1568,7 @@ class H3ProfileStore:
             mapping=mapping,
             workflow_sha256=workflow_sha256,
             source="custom",
+            eligible_workers=(worker,),
         )
 
     def load_job_snapshot(self, job_id: str) -> ResolvedH3Profile:
@@ -1053,7 +1591,58 @@ class H3ProfileStore:
                 "Job workflow profile snapshot hash does not match"
             )
         self._assert_profile_boundary(workflow, profile.mapping)
+        proof_record = self._optional_record(snapshot_dir / _PROOFS_FILE)
+        if profile.id != _BUILTIN_PROFILE_ID and (
+            not profile.eligible_workers
+            or proof_record is None
+            or proof_record.get("workers")
+            != [w.model_dump(mode="json") for w in profile.eligible_workers]
+        ):
+            raise ProfileStorageError(
+                "Custom job snapshot has no matching worker eligibility evidence"
+            )
+        if profile.id != _BUILTIN_PROFILE_ID:
+            proofs = proof_record.get("proofs")
+            if not isinstance(proofs, list) or len(proofs) != len(
+                profile.eligible_workers
+            ):
+                raise ProfileStorageError(
+                    "Custom job snapshot has incomplete worker evidence"
+                )
+            for worker, proof in zip(profile.eligible_workers, proofs, strict=True):
+                if (
+                    not isinstance(proof, dict)
+                    or self._binding_from_record(proof) != worker
+                ):
+                    raise ProfileChangedError(
+                        "Job snapshot worker proof does not match its eligibility"
+                    )
+                if profile.status == "validated":
+                    inspection = proof.get("inspection")
+                    if (
+                        proof.get("valid") is not True
+                        or proof.get("workflow_sha256") != workflow_hash
+                        or proof.get("mapping_sha256")
+                        != self.mapping_sha256(profile.mapping)
+                        or not isinstance(inspection, dict)
+                        or self._binding_from_record(inspection) != worker
+                    ):
+                        raise ProfileChangedError(
+                            "Test job snapshot validation identity is invalid"
+                        )
+                else:
+                    self._validate_worker_proof(
+                        proof,
+                        workflow_sha256=workflow_hash,
+                        mapping_sha256=self.mapping_sha256(profile.mapping),
+                    )
+                    if proof.get("profile_sha256") != self._profile_sha256(profile):
+                        raise ProfileChangedError(
+                            "Job snapshot profile changed after worker verification"
+                        )
         return ResolvedH3Profile(
+            eligible_workers=profile.eligible_workers,
+            worker_proofs=tuple((proof_record or {}).get("proofs", [])),
             profile_id=profile.id,
             workflow=workflow,
             mapping=profile.mapping,
@@ -1099,34 +1688,38 @@ class H3ProfileStore:
             raise ProfileStorageError(
                 "Custom profile requires durable validation and test evidence"
             )
-        test_record = evidence.get("test")
+        proofs = evidence.get("worker_proofs")
         if (
-            evidence.get("valid") is not True
-            or evidence.get("contract_version") != 2
-            or not isinstance(evidence.get("report"), dict)
-            or evidence["report"].get("valid") is not True
-            or not isinstance(evidence.get("comfy"), dict)
-            or evidence["comfy"].get("valid") is not True
-            or not isinstance(test_record, dict)
-            or test_record.get("status") != "succeeded"
-            or not isinstance(test_record.get("job_id"), str)
-            or not test_record["job_id"]
+            not isinstance(proofs, list)
+            or not proofs
+            or not all(isinstance(proof, dict) for proof in proofs)
         ):
             raise ProfileStorageError(
-                "Custom profile requires durable validation and test evidence"
+                "Custom profile requires durable per-worker validation and test evidence"
             )
-        if (
-            evidence.get("workflow_sha256") != workflow_hash
-            or evidence.get("mapping_sha256") != mapping_hash
-            or test_record.get("workflow_sha256") != workflow_hash
-            or test_record.get("mapping_sha256") != mapping_hash
-            or evidence.get("profile_sha256") != self._profile_sha256(profile)
+        workers = tuple(
+            self._validate_worker_proof(
+                proof, workflow_sha256=workflow_hash, mapping_sha256=mapping_hash
+            )
+            for proof in proofs
+        )
+        if workers != profile.eligible_workers or len(
+            set((worker.worker_id, worker.worker_url) for worker in workers)
+        ) != len(workers):
+            raise ProfileChangedError(
+                "Stored profile worker eligibility differs from its verified evidence"
+            )
+        if any(
+            proof.get("profile_sha256") != self._profile_sha256(profile)
+            for proof in proofs
         ):
             raise ProfileChangedError(
                 "Stored profile differs from its validation and test evidence"
             )
         self._assert_profile_boundary(workflow, profile.mapping)
         return ResolvedH3Profile(
+            eligible_workers=workers,
+            worker_proofs=tuple(proofs),
             profile_id=profile.id,
             workflow=workflow,
             mapping=profile.mapping,
@@ -1138,17 +1731,35 @@ class H3ProfileStore:
             else None,
         )
 
-    def _fallback(self, code: str, message: str) -> ResolvedH3Profile:
-        builtin = self._resolve_builtin()
-        return ResolvedH3Profile(
-            profile_id=builtin.profile_id,
-            workflow=builtin.workflow,
-            mapping=builtin.mapping,
-            workflow_sha256=builtin.workflow_sha256,
-            source=builtin.source,
-            warning=ProfileWarning(code=code, message=message),
-            display_name=builtin.display_name,
-        )
+    @staticmethod
+    def _require_presubmit_job(job: JobRecord) -> None:
+        from app.core.schemas import JobStatus
+
+        if (
+            job.status not in {JobStatus.queued, JobStatus.uploading}
+            or job.comfy_prompt_id
+        ):
+            raise ProfileStorageError(
+                "H3 execution job is missing its original workflow snapshot; active profile substitution is forbidden"
+            )
+
+    @staticmethod
+    def _require_job_worker(
+        job: JobRecord, worker: H3WorkerBinding, *, durable: bool
+    ) -> None:
+        params = job.params or {}
+        if (
+            params.get("worker_id") != worker.worker_id
+            or params.get("worker_url") != worker.worker_url
+        ):
+            raise ProfileChangedError(
+                "H3 test job requested worker does not match the import worker"
+            )
+        if durable or job.worker_id is not None or job.worker_url is not None:
+            if job.worker_id != worker.worker_id or job.worker_url != worker.worker_url:
+                raise ProfileChangedError(
+                    "H3 test job durable worker pin does not match the import worker"
+                )
 
     @staticmethod
     def _display_name(metadata: dict[str, Any] | None) -> str:

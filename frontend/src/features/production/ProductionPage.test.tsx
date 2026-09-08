@@ -10,7 +10,7 @@ import { listLibraryAssets } from "../library/api";
 const replaceShotMaterialsMock = vi.hoisted(() => vi.fn());
 const getH3ProviderStatusMock = vi.hoisted(() => vi.fn());
 const fetchH3ProfilesMock = vi.hoisted(() => vi.fn());
-vi.mock("../../shared/api/client", () => ({ fetchH3Profiles: fetchH3ProfilesMock }));
+vi.mock("../../shared/api/client", async (importOriginal) => ({ ...await importOriginal<typeof import("../../shared/api/client")>(), fetchH3Profiles: fetchH3ProfilesMock }));
 
 let currentProjectId = "prj_test";
 
@@ -100,7 +100,7 @@ describe("ProductionPage prompt refresh", () => {
   afterEach(cleanup);
 
   beforeEach(() => {
-    fetchH3ProfilesMock.mockResolvedValue({ active: { display_name: "My H3 Quality Profile", source: "custom", warning: null }, profiles: [] });
+    fetchH3ProfilesMock.mockResolvedValue({ active: { display_name: "My H3 Quality Profile", source: "custom", eligible_workers: [{ worker_id: "worker-a", worker_url: "http://worker-a:8188" }], warning: null }, profiles: [] });
     vi.clearAllMocks();
     currentProjectId = "prj_test";
     vi.mocked(listLibraryAssets).mockResolvedValue([]);
@@ -118,51 +118,56 @@ describe("ProductionPage prompt refresh", () => {
     expect(screen.getByText("Render workers · ComfyUI — My H3 Quality Profile")).toBeTruthy();
   });
 
-  it("refreshes a damaged profile before local submission and again after completion while retaining the captured profile", async () => {
+  it("blocks local submission when the selected workflow becomes damaged", async () => {
     const ready = { ...shot(generatedPrompt), refs: [{ role: "actor" as const, asset_id: "act_1", picture_index: 1 }] };
     vi.mocked(getProject).mockResolvedValue(detail(ready));
-    const captured = {
-      id: "job-refresh", status: "running" as const, name: "H3", notes: "", prompt: "",
-      dialogue: [], frames: 56, error: null, comfy_prompt_id: "prompt-1", external_task_id: null,
-      created_at: "now", updated_at: "now", outputs: {}, input_previews: {}, pipeline_id: "h3_ref2va",
-      h3_provider: "local" as const, h3_profile_id: "builtin-official-h3", h3_profile_sha256: "official-hash",
-    };
-    vi.mocked(getH3Job).mockResolvedValue(captured);
-    let statusRefreshedBeforeSubmit = false;
-    vi.mocked(submitShot).mockImplementation(async () => {
-      statusRefreshedBeforeSubmit = fetchH3ProfilesMock.mock.calls.length >= 2;
-      return { ...ready, status: "queued", h3_job_id: captured.id };
-    });
     render(<ProductionPage active />);
     await screen.findByText("Workflow: My H3 Quality Profile");
-    fetchH3ProfilesMock.mockResolvedValue({ active: {
-      profile_id: "builtin-official-h3", display_name: "Built-in Official H3", source: "builtin",
-      warning: { code: "profile_changed", message: "Custom workflow hash changed" },
-    }, profiles: [] });
+    fetchH3ProfilesMock.mockResolvedValue({ active: null, selected_profile_id: "custom-damaged",
+      active_error: { code: "profile_changed", message: "Custom workflow hash changed" }, profiles: [] });
     fireEvent.click(await screen.findByText("Corridor walk-in"));
     fireEvent.click(screen.getByRole("tab", { name: "Run H3" }));
     fireEvent.click(screen.getByRole("button", { name: "Submit H3" }));
-    await waitFor(() => expect(submitShot).toHaveBeenCalled());
-    expect(statusRefreshedBeforeSubmit).toBe(true);
-    await screen.findByText("Custom workflow hash changed");
-    await screen.findByText(/Submitted workflow: Built-in Official H3/);
-    fetchH3ProfilesMock.mockResolvedValue({ active: {
-      profile_id: "custom-new", display_name: "Newly active profile", source: "custom", warning: null,
-    }, profiles: [] });
-    vi.mocked(getH3Job).mockResolvedValue({ ...captured, status: "succeeded", outputs: { video: { key: "video", filename: "done.mp4", url: "/done.mp4", label: "Video" } } });
-    await screen.findByText("Workflow: Newly active profile", {}, { timeout: 3500 });
-    expect(screen.getByText(/Submitted workflow: Built-in Official H3/)).toBeTruthy();
-    expect(screen.getByText(/official-hash/)).toBeTruthy();
-    expect(submitShot).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getAllByText(/Selected workflow custom-damaged: Custom workflow hash changed/).length).toBeGreaterThan(0));
+    expect(fetchH3ProfilesMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(submitShot).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Built-in Official H3/)).toBeNull();
   });
 
-  it("discloses fallback without blocking the Production workspace", async () => {
-    fetchH3ProfilesMock.mockResolvedValue({ active: { display_name: "Built-in Official H3", source: "builtin", warning: { code: "custom_profile_unavailable", message: "Custom workflow hash changed" } }, profiles: [] });
+  it("shows active selection failure while keeping the Production workspace editable", async () => {
+    fetchH3ProfilesMock.mockResolvedValue({ active: null, selected_profile_id: "missing-custom",
+      active_error: { code: "custom_profile_unavailable", message: "Selected workflow file is missing" }, profiles: [] });
     vi.mocked(getProject).mockResolvedValue(detail(shot(emptyPrompt)));
     render(<ProductionPage active />);
-    expect(await screen.findByText("Using Built-in Official H3")).toBeTruthy();
-    expect(screen.getByText("Custom workflow hash changed")).toBeTruthy();
+    expect(await screen.findByText(/missing-custom: Selected workflow file is missing/)).toBeTruthy();
+    expect(screen.queryByText(/Built-in Official H3/)).toBeNull();
     expect(screen.getByRole("heading", { name: "Production" })).toBeTruthy();
+  });
+
+  it("blocks local submission when workflow discovery fails", async () => {
+    const ready = { ...shot(generatedPrompt), refs: [{ role: "actor" as const, asset_id: "act_1", picture_index: 1 }] };
+    vi.mocked(getProject).mockResolvedValue(detail(ready));
+    render(<ProductionPage active />);
+    await screen.findByText("Workflow: My H3 Quality Profile");
+    fetchH3ProfilesMock.mockRejectedValue(new Error("Workflow service unavailable"));
+    fireEvent.click(await screen.findByText("Corridor walk-in"));
+    fireEvent.click(screen.getByRole("tab", { name: "Run H3" }));
+    fireEvent.click(screen.getByRole("button", { name: "Submit H3" }));
+    await waitFor(() => expect(screen.getAllByText(/Workflow service unavailable/).length).toBeGreaterThan(0));
+    expect(submitShot).not.toHaveBeenCalled();
+  });
+
+  it("blocks local submission when a custom workflow has no eligible workers", async () => {
+    const ready = { ...shot(generatedPrompt), refs: [{ role: "actor" as const, asset_id: "act_1", picture_index: 1 }] };
+    vi.mocked(getProject).mockResolvedValue(detail(ready));
+    fetchH3ProfilesMock.mockResolvedValue({ active: { profile_id: "custom-unverified", source: "custom", eligible_workers: [] }, profiles: [] });
+    render(<ProductionPage active />);
+    await screen.findByText(/Selected workflow custom-unverified has no eligible render workers/);
+    fireEvent.click(await screen.findByText("Corridor walk-in"));
+    fireEvent.click(screen.getByRole("tab", { name: "Run H3" }));
+    fireEvent.click(screen.getByRole("button", { name: "Submit H3" }));
+    await waitFor(() => expect(fetchH3ProfilesMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(submitShot).not.toHaveBeenCalled();
   });
 
   it("refreshes profile status on terminal completion without replacing the selected job", async () => {
@@ -177,10 +182,10 @@ describe("ProductionPage prompt refresh", () => {
     await screen.findByText("Workflow: My H3 Quality Profile");
     fireEvent.click(await screen.findByText("Corridor walk-in"));
     await waitFor(() => expect(getH3Job).toHaveBeenCalledWith("job-existing"));
-    fetchH3ProfilesMock.mockResolvedValue({ active: { display_name: "Built-in Official H3", source: "builtin",
-      warning: { code: "profile_changed", message: "Profile damaged during run" } }, profiles: [] });
+    fetchH3ProfilesMock.mockResolvedValue({ active: null, selected_profile_id: "custom-captured",
+      active_error: { code: "profile_changed", message: "Profile damaged during run" }, profiles: [] });
     vi.mocked(getH3Job).mockResolvedValue({ ...job, status: "failed", error: "Output failed" });
-    await screen.findByText("Profile damaged during run", {}, { timeout: 3500 });
+    await screen.findByText(/Profile damaged during run/, {}, { timeout: 3500 });
     expect(screen.getByText(/Submitted workflow: custom-captured/)).toBeTruthy();
     expect(submitShot).not.toHaveBeenCalled();
   });

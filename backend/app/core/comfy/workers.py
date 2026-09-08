@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +9,7 @@ from typing import Any
 
 from ...config import settings
 from .client import ComfyClient, ComfyError, validate_base_url
+from .memory import memory_snapshot
 
 
 def _now() -> str:
@@ -37,6 +37,25 @@ def parse_workers(value: str) -> list[Worker]:
             raise ComfyError("DS_COMFY_WORKERS contains a duplicate worker ID or endpoint")
         workers.append(Worker(worker_id, endpoint))
     return workers
+
+
+def _profile_eligibility(job: Any) -> set[tuple[str, str]] | None:
+    if job.pipeline_id != "h3_ref2va":
+        return None
+    value = job.params.get("h3_eligible_workers")
+    custom = job.params.get("h3_profile_id") not in {None, "builtin-official-h3"}
+    if value is None and not custom:
+        return None
+    if not isinstance(value, list) or not value:
+        if not custom and value == []:
+            return None
+        raise ComfyError(f"H3 profile {job.params.get('h3_profile_id')!r} has no validated worker evidence")
+    pairs: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("worker_id"), str) or not isinstance(item.get("worker_url"), str):
+            raise ComfyError("H3 profile snapshot contains invalid worker eligibility")
+        pairs.add((item["worker_id"], validate_base_url(item["worker_url"])))
+    return pairs
 
 
 class WorkerRegistry:
@@ -76,7 +95,10 @@ class WorkerRegistry:
     async def bind_job(self, job: Any, allow_selection: bool = True) -> ComfyClient:
         from ..jobs.store import save_job
         async with self._lock:
+            eligible = _profile_eligibility(job)
             if job.worker_id or job.worker_url:
+                if eligible is not None and (job.worker_id, job.worker_url) not in eligible:
+                    raise ComfyError(f"Job {job.id} worker pin has no matching validation/test evidence for H3 profile {job.params.get('h3_profile_id')!r}")
                 worker = self.workers.get(job.worker_id)
                 if not worker or worker.base_url != job.worker_url:
                     raise ComfyError(f"Job {job.id} is pinned to worker {job.worker_id!r} at {job.worker_url!r}; that exact worker configuration is unavailable. Job will not be rerouted")
@@ -87,10 +109,19 @@ class WorkerRegistry:
                 if not states:
                     raise ComfyError("No render workers configured. Set DS_COMFY_WORKERS explicitly")
                 requested = job.params.get("worker_id")
-                candidates = [s for s in states if s["status"] == "up" and (requested is None or s["id"] == requested)]
+                requested_url = job.params.get("worker_url")
+                if requested_url is not None:
+                    configured = self.workers.get(requested)
+                    if configured is None or configured.base_url != validate_base_url(requested_url):
+                        raise ComfyError(f"Requested render worker {requested!r} changed endpoint or is no longer configured; job will not be rerouted")
+                candidates = [s for s in states if s["status"] == "up"
+                              and (requested is None or s["id"] == requested)
+                              and (eligible is None or (s["id"], s["base_url"]) in eligible)]
                 if not candidates:
                     reasons = "; ".join(f"{s['id']}: {s['error'] or s['status']}" for s in states)
-                    raise ComfyError(f"No eligible render worker{f' matching {requested!r}' if requested else ''}. {reasons}")
+                    raise ComfyError(f"No eligible render worker{f' matching {requested!r}' if requested else ''}"
+                                     + (f" with validation/test evidence for H3 profile {job.params.get('h3_profile_id')!r}" if eligible is not None else "")
+                                     + f". {reasons}")
                 # Rotating tie-break + remote queue load + this process's in-flight claims.
                 order = list(self.workers)
                 rank = {key: (i - self._next) % len(order) for i, key in enumerate(order)}
@@ -112,45 +143,33 @@ class WorkerRegistry:
 
     async def check_h3_admission(self, job: Any, client: ComfyClient) -> None:
         from ..jobs.store import save_job
-        ram_threshold = settings.comfy_min_free_ram_gib
         vram_threshold = settings.comfy_min_free_vram_gib
         snapshot: dict[str, Any] = {"worker_id": job.worker_id, "worker_url": job.worker_url,
             "checked_at": _now(), "ram_free_bytes": None, "ram_total_bytes": None, "devices": [],
-            "min_free_ram_bytes": int(ram_threshold * 1024**3) if ram_threshold is not None else None,
+            "metric": "vram_free", "threshold_provisional": settings.comfy_memory_threshold_provisional,
             "min_free_vram_bytes": int(vram_threshold * 1024**3) if vram_threshold is not None else None,
             "accepted": False, "error": None}
         job.memory_admission = snapshot
         problems: list[str] = []
-
-        def measured(value: Any, label: str) -> int | None:
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                problems.append(f"/system_stats is missing a valid {label}")
-                return None
-            return int(value)
-
+        calibration_test = (
+            job.params.get("h3_profile_test") is True
+            and type(job.params.get("frames")) is int
+            and job.params["frames"] == 56
+        )
+        if settings.comfy_memory_threshold_provisional and not calibration_test:
+            problems.append(
+                "Provisional H3 memory threshold permits only 56-frame profile calibration tests; "
+                "production H3 is blocked until the operator sets a final DS_COMFY_MIN_FREE_VRAM_GIB "
+                "and DS_COMFY_MEMORY_THRESHOLD_PROVISIONAL=false"
+            )
         try:
-            stats = await client.health()
-            system = stats.get("system") or {}
-            snapshot["ram_free_bytes"] = measured(system.get("ram_free"), "system.ram_free")
-            snapshot["ram_total_bytes"] = measured(system.get("ram_total"), "system.ram_total")
-            devices = stats.get("devices")
-            if not isinstance(devices, list) or not devices:
-                problems.append("/system_stats has no GPU devices")
-            else:
-                for device in devices:
-                    snapshot["devices"].append({"index": device.get("index"), "name": device.get("name"),
-                        "vram_free_bytes": measured(device.get("vram_free"), "device.vram_free"),
-                        "vram_total_bytes": measured(device.get("vram_total"), "device.vram_total")})
-            for field, config_key in (("min_free_ram_bytes", "DS_COMFY_MIN_FREE_RAM_GIB"), ("min_free_vram_bytes", "DS_COMFY_MIN_FREE_VRAM_GIB")):
-                if snapshot[field] is None:
-                    problems.append(f"{config_key} must be explicitly configured for H3")
-            free_ram = snapshot["ram_free_bytes"]
-            min_ram = snapshot["min_free_ram_bytes"]
-            if free_ram is not None and min_ram is not None and free_ram < min_ram:
-                problems.append(f"system RAM free={free_ram / 1024**3:.2f} GiB ({free_ram} bytes), required={min_ram / 1024**3:.2f} GiB ({min_ram} bytes)")
+            measurement = memory_snapshot(await client.health(), phase="admission")
+            snapshot.update({key: measurement[key] for key in ("ram_free_bytes", "ram_total_bytes", "devices")})
+            if snapshot["min_free_vram_bytes"] is None:
+                problems.append("DS_COMFY_MIN_FREE_VRAM_GIB must be explicitly configured for H3")
             for device in snapshot["devices"]:
                 free_vram, min_vram = device["vram_free_bytes"], snapshot["min_free_vram_bytes"]
-                if free_vram is not None and min_vram is not None and free_vram < min_vram:
+                if min_vram is not None and free_vram < min_vram:
                     problems.append(f"GPU {device['index']} VRAM free={free_vram / 1024**3:.2f} GiB ({free_vram} bytes), required={min_vram / 1024**3:.2f} GiB ({min_vram} bytes)")
         except Exception as exc:
             problems.append(f"Cannot measure H3 headroom: {exc}")

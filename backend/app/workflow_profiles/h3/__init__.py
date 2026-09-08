@@ -16,6 +16,7 @@ from .models import (
     H3ValidationIssue,
     H3WorkflowAnalysis,
     H3WorkflowProfile,
+    H3WorkerBinding,
     ResolvedH3Profile,
     ValidationReport,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "H3ValidationIssue",
     "H3WorkflowAnalysis",
     "H3WorkflowProfile",
+    "H3WorkerBinding",
     "ProfileChangedError",
     "ProfileStateError",
     "ProfileStorageError",

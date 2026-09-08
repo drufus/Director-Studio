@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -332,8 +333,9 @@ async def _save_completed_outputs(
     client: ComfyClient,
     history: dict[str, Any],
     cancel_event: asyncio.Event | None = None,
+    completion_check: Callable[[], None] | None = None,
 ) -> JobRecord:
-    """Map, download, postprocess, and persist one completed Comfy prompt."""
+    """Retain complete artifacts before final checks can fail the execution."""
     job = store.load_job(job_id)
     if job is None:
         raise ComfyError(f"job disappeared while completing: {job_id}")
@@ -378,10 +380,15 @@ async def _save_completed_outputs(
         if hasattr(pipeline, "labels_for_job")
         else pipeline.output_labels
     )
-    job.status = JobStatus.succeeded
-    job.error = None
     job.outputs = store.build_output_slots(job_id, saved, labels=labels)
     job.input_previews = store.input_preview_urls(job_id)
+    if completion_check is not None:
+        # An incomplete calibration must retain its rendered evidence, without
+        # ever becoming succeeded or invoking a profile activation proof hook.
+        store.save_job(job)
+        completion_check()
+    job.status = JobStatus.succeeded
+    job.error = None
     store.save_job(job)
     # H3 validation evidence requires the complete output record to exist first.
     # The adapter demotes this provisional success if either hook fails.
@@ -442,6 +449,9 @@ async def cancel_job(job_id: str) -> JobRecord | None:
                     job.error += f"; Terminal shot synchronization failed: {sync_exc}"
                     store.save_job(job)
                 raise
+        # Remote cancellation yields while telemetry may append a newer sample.
+        # Keep those durable measurements instead of saving the pre-request copy.
+        job = store.load_job(job_id) or job
         job.status = JobStatus.cancelled
         if adapter.id == "h3_api":
             if job.external_task_id:

@@ -19,7 +19,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source layout and exten
 
 ## Native macOS and Linux setup
 
-The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The cluster port is staged: native startup and LiteLLM planning with independent GPU coordination are implemented. Remote worker routing, HTTP file movement, durable job pinning, and H3 memory admission are implemented. Worker-bound H3 profile activation evidence and systemd deployment remain separate phases. Configure [remote workers](docs/REMOTE-WORKERS.md) and [LLM provider settings](docs/LLM-PROVIDERS.md).
+The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The cluster port is staged: native startup and LiteLLM planning with independent GPU coordination are implemented. Remote worker routing, HTTP file movement, durable job pinning, and H3 memory admission are implemented. Worker-bound H3 inspection, validation, test evidence, and activation are implemented; the remote SPARK 56-frame test and activation have passed with complete memory telemetry. Production H3 admission remains blocked until the operator sets a measured threshold. Systemd deployment remains a separate phase. Configure [remote workers](docs/REMOTE-WORKERS.md), [H3 worker profiles](docs/H3-WORKER-PROFILES.md), and [LLM provider settings](docs/LLM-PROVIDERS.md).
 
 Install Python 3.11+ (3.12 recommended), Node.js 22.12+ with npm, and FFmpeg/ffprobe on `PATH`. On macOS, Homebrew can provide `python@3.12`, `node@22`, and `ffmpeg`; follow its instructions to put the selected executables on `PATH`. On Ubuntu/DGX OS, install `python3-venv`, `python3-pip`, and `ffmpeg`, plus a supported Node.js version.
 
@@ -102,20 +102,20 @@ Start Ollama and ComfyUI first, then run:
 
 If the MCP process cannot start, verify both configured executable paths. You can run `comfy --help` to check the Comfy CLI; do not use `comfy-mcp --help`, because that entry point starts the stdio server. If a workflow fails, load the same workflow in ComfyUI and confirm its custom nodes and models are installed.
 
-### Connect a custom H3 workflow
+## Connect a custom H3 workflow
 
-Every clean Portable starts with **Built-in Official H3**. First make sure your custom H3 Ref2AV workflow already runs successfully in the same local ComfyUI. Then connect it at runtime:
+A fresh data root with no saved selection uses **Built-in Official H3** as its initial default. Import a genuine API-format export of your working H3 graph, and explicitly choose its configured remote worker:
 
 ```text
-Settings -> Workflows -> H3 -> Import Workflow
+Settings -> Workflows -> H3 -> Choose Worker -> Import Workflow
 -> Final Video Output -> H3 Inputs -> Validate & Test -> Use Workflow
 ```
 
 Director Studio treats everything inside the selected path as an opaque ComfyUI graph. It first lists terminal video nodes; after you choose the final output, it searches backward and asks you to confirm the upstream `MiniMaxH3ReferenceToVideo` node and optional seed node. Node titles are shown before class names and IDs. The application only injects prompt, width, height, frame count, Picture 1–9, optional standalone Audio 1–3, and an optional seed. Internal models, samplers, LoRAs, upscalers, frame interpolation, and muxing stay exactly as the workflow defines them.
 
-The 56-frame test retains videos only from the final output node you selected. If that node emits several videos, preview them and choose one; this selection does not rerun ComfyUI. Reference-video inputs are not supported. Ollama is not used for importing, mapping, validating, or testing a custom workflow—the setup is deterministic and uses ComfyUI metadata plus your confirmations.
+Inspection, dependency validation, and the 56-frame test are bound to the selected worker ID and URL. Changing that binding invalidates the evidence; activation requires a successful current test. The test retains videos only from the final output node you selected. If that node emits several videos, preview them and choose one; this selection does not rerun ComfyUI. Reference-video inputs are not supported. Ollama is not used for importing, mapping, validating, or testing a custom workflow—the setup is deterministic and uses ComfyUI metadata plus your confirmations.
 
-Imported workflow JSON and its setup metadata stay under the external `data/workflow_profiles` directory and are never embedded in a release executable or zip. Any custom nodes, models, LoRAs, and other dependencies referenced by an imported graph remain the user's ComfyUI responsibility. If a custom workflow becomes unavailable or invalid, Director Studio falls back to **Built-in Official H3**.
+Imported workflow JSON and its setup metadata stay under the external `data/workflow_profiles` directory and are never embedded in a release executable or zip. Any custom nodes, models, LoRAs, and other dependencies referenced by an imported graph remain the user's ComfyUI responsibility. If an explicitly selected workflow becomes unavailable, changed, or invalid, Director Studio reports its requested identity and blocks submission. Recover by repairing it or explicitly selecting **Built-in Official H3**; it never switches automatically. See [H3 worker profiles and memory admission](docs/H3-WORKER-PROFILES.md).
 
 Workflow changes apply only to jobs submitted after the switch. Queued and running jobs keep the immutable workflow snapshot captured when they were submitted. You can switch back to **Built-in Official H3** without restarting, and doing so does not alter work already in flight.
 
@@ -169,7 +169,7 @@ For a new or incompatible graph:
 4. Add tests for graph validation, prompt injection, and output mapping.
 5. Rebuild with `pwsh -File scripts/build-legacy-portable.ps1`.
 
-Non-H3 custom-workflow overrides remain source-only in the current release. Portable supports H3 Ref2AV workflow import through Settings, while the packaged official workflow remains a read-only fallback. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the pipeline contract and extension points.
+Non-H3 custom-workflow overrides remain source-only in the current release. Portable supports H3 Ref2AV workflow import through Settings, while the packaged official workflow remains an explicitly selectable built-in. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the pipeline contract and extension points.
 
 ## Replacing bundled generation workflows
 

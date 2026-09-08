@@ -34,7 +34,7 @@ def _link(path: Path, target: Path, kind: str) -> None:
 @pytest.mark.parametrize(
     "kind", ["hardlink"] if os.name == "nt" else ["symlink", "hardlink"]
 )
-def test_linked_profile_files_force_fallback(tmp_path, monkeypatch, filename, kind):
+def test_linked_profile_files_fail_selected_profile(tmp_path, monkeypatch, filename, kind):
     store = installed_custom_store(tmp_path, monkeypatch)
     path = (
         store.active_path
@@ -45,9 +45,8 @@ def test_linked_profile_files_force_fallback(tmp_path, monkeypatch, filename, ki
     target.write_bytes(path.read_bytes())
     path.unlink()
     _link(path, target, kind)
-    resolved = store.resolve_active()
-    assert resolved.source == "builtin"
-    assert resolved.warning is not None
+    with pytest.raises(ProfileStorageError, match="Selected H3 profile"):
+        store.resolve_active()
     with pytest.raises(ProfileStorageError):
         store._atomic_write_bytes(path, b"replacement")
     assert target.read_bytes() != b"replacement"

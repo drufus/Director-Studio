@@ -1,3 +1,5 @@
+import type { H3WorkerBinding } from "../../shared/api/types";
+
 export interface H3InputMapping {
   h3_node_id: string;
   prompt_input: string;
@@ -52,6 +54,10 @@ export interface H3Lifecycle {
   mapping_sha256: string | null;
   validated_at: string | null;
   test_job_id: string | null;
+  worker: H3WorkerBinding | null;
+  inspected_at?: string | null;
+  metadata_sha256?: string | null;
+  invalidation_reason: string | null;
 }
 export interface H3Analysis {
   import_id: string;
@@ -86,4 +92,6 @@ export interface H3TestRun {
   workflow_sha256: string;
   mapping_sha256: string;
   status: "queued";
+  worker_id: string;
+  worker_url: string;
 }
