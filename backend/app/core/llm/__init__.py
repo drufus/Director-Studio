@@ -1,14 +1,16 @@
+from ...config import settings
 from .ollama import OllamaLLMProvider
-from .provider import LLMProvider
+from .openai_compatible import OpenAICompatibleClient, OpenAICompatibleLLMProvider
+from .provider import InferenceClient, LLMProvider, LLMProviderError, public_llm_error
 
 
 def get_llm_provider() -> LLMProvider:
-    """Return the configured Director LLM provider.
+    if settings.llm_provider == "openai_compatible":
+        return OpenAICompatibleLLMProvider()
+    if settings.llm_provider == "ollama":
+        return OllamaLLMProvider()
+    raise LLMProviderError("Unknown Director LLM provider.")
 
-    Ollama is the only provider today; callers depend on the boundary so a remote
-    provider can be introduced without leaking its transport into Director APIs.
-    """
-    return OllamaLLMProvider()
 
-
-__all__ = ["LLMProvider", "OllamaLLMProvider", "get_llm_provider"]
+__all__ = ["InferenceClient", "LLMProvider", "LLMProviderError", "OllamaLLMProvider",
+           "OpenAICompatibleClient", "OpenAICompatibleLLMProvider", "get_llm_provider", "public_llm_error"]

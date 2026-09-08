@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .runtime_paths import runtime_paths
@@ -12,7 +12,7 @@ _DEFAULT_DATA_DIR = runtime_paths.data_root
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DS_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_prefix="DS_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     comfy_base_url: str = "http://127.0.0.1:8188"
     host: str = "127.0.0.1"
@@ -70,12 +70,19 @@ class Settings(BaseSettings):
     gpt_bridge_action_delay_sec: float = 1.5
     gpt_bridge_job_cooldown_sec: float = 15.0
 
-    # Local Ollama / Director agent (VRAM exclusive with Comfy)
+    # Director inference. Cluster deployments explicitly select the remote provider.
+    llm_provider: Literal["ollama", "openai_compatible"] = "ollama"
+    llm_base_url: str = ""
+    llm_api_key: SecretStr = SecretStr("")
+    llm_model: str = ""
+    # Explicit operator-verified capabilities; never infer vision from model names.
+    llm_vision_models: str = ""
+    # Local Ollama / shared-GPU compatibility.
     ollama_base_url: str = "http://127.0.0.1:11434"
     director_plan_model: str = ""
     director_num_ctx: int = 32768
     director_num_predict: int = 4096
-    vram_policy: str = "exclusive"  # exclusive: one of LLM/Comfy at a time, others queue
+    vram_policy: Literal["exclusive", "independent"] = "exclusive"
     # Max seconds to wait in GPU queue (Plan waits for H3, next gen waits for casting, …)
     vram_acquire_timeout_sec: float = 3600.0
     # Multi-turn residency: keep Ollama loaded between chat/plan turns.
@@ -89,6 +96,10 @@ class Settings(BaseSettings):
         if not isinstance(values, dict):
             return values
         configured = dict(values)
+        provider = configured.get("llm_provider", "ollama")
+        configured.setdefault("vram_policy", "independent" if provider == "openai_compatible" else "exclusive")
+        if provider == "openai_compatible" and configured["vram_policy"] != "independent":
+            raise ValueError("OpenAI-compatible inference requires DS_VRAM_POLICY=independent.")
         data_root = Path(configured.get("data_dir") or _DEFAULT_DATA_DIR)
         configured.setdefault("data_dir", data_root)
         configured.setdefault("jobs_dir", data_root / "jobs")

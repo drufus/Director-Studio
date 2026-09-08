@@ -24,7 +24,7 @@ def test_liveness_does_not_contact_inference_providers(monkeypatch):
         raise AssertionError("Liveness must not depend on inference providers")
 
     monkeypatch.setattr("app.api.health.ComfyClient", forbidden)
-    monkeypatch.setattr("app.api.health.OllamaClient", forbidden)
+    monkeypatch.setattr("app.api.health.get_llm_provider", forbidden)
     app = FastAPI()
     app.include_router(health_router, prefix="/api")
 

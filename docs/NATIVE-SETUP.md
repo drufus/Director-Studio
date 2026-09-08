@@ -1,6 +1,6 @@
 # Native macOS and Linux setup
 
-This is the Phase 1 launch/build path for the cluster port. The API and browser UI run on macOS or Linux. Actual cluster inference and deployment are later phases: the existing application still uses its Ollama/MCP integration until those adapters are replaced. A successful startup check does not claim that remote generation or LiteLLM planning is ready.
+This is the native launch/build path for the cluster port. The API and browser UI run on macOS or Linux. Phase 2 adds [LiteLLM planning and independent GPU coordination](LLM-PROVIDERS.md). Remote generation and cluster deployment remain later phases; Comfy still uses the legacy MCP transport. A successful startup check alone does not establish inference readiness.
 
 The [accepted cluster decisions](CLUSTER-PORT-PLAN.md) record the subsequent inference, worker, H3, and chat-admission requirements.
 
@@ -68,7 +68,7 @@ Use `http://127.0.0.1:5173`. Vite proxies `/api` to the backend on `127.0.0.1:87
 (cd frontend && npm test && npm run build)
 ```
 
-`GET /api/health/live` returns `{"ok": true}` when this service is running, without making requests to inference providers. `GET /` serves the built UI. The existing `/api/health` endpoint reports external provider availability and may wait on those providers; it is not used for native launch smoke tests. Its provider contract changes in the LLM/worker phases.
+`GET /api/health/live` returns `{"ok": true}` when this service is running, without making requests to inference providers. `GET /` serves the built UI. The existing `/api/health` endpoint reports external provider availability and may wait on those providers; it is not used for native launch smoke tests. It reports the configured LLM provider/model separately from Comfy readiness.
 
 The native CI matrix runs Python 3.12 on macOS ARM64, Linux x64, and Linux ARM64, with Node 22 and FFmpeg. It runs the setup script from a clean checkout, the full native backend suite, frontend tests/build, and a real startup/UI/liveness/graceful-shutdown smoke check with an isolated data directory. No inference endpoints, credentials, Windows packaging tools, or Docker daemon are required for those checks.
 

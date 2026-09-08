@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+from ....core.llm import LLMProviderError
+from ....core.vram.director_model import ModelSelectionError
 from ....core.projects.models import AssetCoverageReview, Project, Shot
 from ....core.projects.store import save_project
 from ..planner import (
@@ -152,6 +154,8 @@ async def handle_project_tool(
         actions.append("plan")
         try:
             await svc.plan_project(project_id)
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as exc:
             logger.exception("plan_shots tool failed")
             notes.append(f"Shot planning failed: {exc}")
@@ -160,7 +164,7 @@ async def handle_project_tool(
         if not shots:
             notes.append(
                 "Shot planning failed: no shots were generated. "
-                "Retry or inspect the Ollama output."
+                "Retry or inspect the Director provider error."
             )
         else:
             titles = ", ".join(shot.title for shot in shots[:6])

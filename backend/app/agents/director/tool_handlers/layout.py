@@ -7,6 +7,8 @@ import re
 from typing import Any, Callable
 
 from ....config import settings
+from ....core.llm import LLMProviderError
+from ....core.vram.director_model import ModelSelectionError
 from ....core.library.store import load_asset
 from ....core.projects.layouts import (
     GptLayoutBrief,
@@ -171,6 +173,8 @@ async def handle_layout_tool(
                 notes.append(
                     "Rewrote the H3 prompt with the accepted Layout's real Picture index."
                 )
+            except (LLMProviderError, ModelSelectionError):
+                raise
             except Exception as exc:
                 logger.exception(
                     "write_prompt after accept_ref_frame failed for %s",
@@ -657,6 +661,8 @@ async def handle_layout_tool(
             s2 = await svc.write_prompts_after_layout(shot.id)
             notes.append(f"Prompt written for **{s2.title}**")
             touched.add(s2.id)
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as e:
             logger.exception("write_prompt tool failed")
             notes.append(f"Prompt writing failed: {e}")

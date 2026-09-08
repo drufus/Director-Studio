@@ -1,4 +1,4 @@
-"""Pack library / layout stills as Ollama vision inputs (base64 JPEG thumbnails)."""
+"""Pack library / layout stills as provider image inputs (base64 JPEG thumbnails)."""
 
 from __future__ import annotations
 

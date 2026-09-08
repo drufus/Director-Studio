@@ -9,6 +9,7 @@ sentences always go through the LLM.
 from __future__ import annotations
 
 import json
+import uuid
 import logging
 import re
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ from typing import Any, Awaitable, Callable
 from ...config import settings
 from ...core.jobs import create_job, load_job, start_pipeline_job
 from ...core.jobs.runner import await_pipeline_job
+from ...core.llm import LLMProviderError
 from ...core.projects.layouts import (
     GptLayoutBrief,
     LayoutBrief,
@@ -41,6 +43,7 @@ from ...core.projects.transitions import (
     select_layout_reference,
 )
 from ...core.vram import GenerationActiveError
+from ...core.vram.director_model import ModelSelectionError
 from ...core.library.store import load_asset
 from ...pipelines.registry import get_pipeline
 from .planner import ShotRefsPatchSubmission, StoryboardSubmission
@@ -442,6 +445,7 @@ def _native_reply(value: dict[str, Any]) -> tuple[str, str, list[dict[str, Any]]
         if name:
             tools.append(
                 {
+                    "id": str(call.get("id") or ""),
                     "name": name,
                     "args": arguments if isinstance(arguments, dict) else {},
                 }
@@ -558,6 +562,8 @@ async def _approve_layout_with_prompt(
         s2 = await svc.write_prompts_after_layout(s2.id)
         note += "; six-section prompt written"
         await _emit(on_progress, "status", f"Prompt complete: {s2.title}")
+    except (LLMProviderError, ModelSelectionError):
+        raise
     except Exception as e:
         logger.exception("write_prompts after approve failed for %s", s2.id)
         note += f"; prompt failed ({e}) — ask me to write the prompt for that shot to retry"
@@ -740,7 +746,7 @@ async def _execute_intent(
         if not (project.script_text or "").strip():
             return "This project has no script yet. Send me the story or script first.", actions, touched
         actions.append("plan")
-        await _emit(on_progress, "status", "Shortcut: plan shots · Queueing the GPU, unloading Comfy, and loading Ollama…")
+        await _emit(on_progress, "status", "Shortcut: plan shots · Checking the selected Director model…")
         try:
             await _emit(on_progress, "status", "The Director planning model is breaking down shots and casting assets…")
             await svc.plan_project(project_id)
@@ -754,6 +760,8 @@ async def _execute_intent(
                 )
             await _emit(on_progress, "status", f"Shot planning complete: {len(shots)} shot{'s' if len(shots) != 1 else ''}")
             return "Shot planning is complete.\n\n" + _status_summary(project, shots), actions, touched
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as e:
             logger.exception("chat plan failed")
             return f"Shot planning failed: {e}", actions, touched
@@ -838,6 +846,8 @@ async def _execute_intent(
             reply += "\n\n" + _status_summary(project, shots)
             await _emit(on_progress, "status", f"Composition-reference queue complete ({n} updated)")
             return reply, actions, touched
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as e:
             logger.exception("chat ref_frame_all failed")
             return f"Could not queue composition references: {e}", actions, touched
@@ -887,6 +897,8 @@ async def _execute_intent(
                     "When it finishes, inspect the image and decide whether it is usable."
                 )
             return reply, actions, touched
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as e:
             logger.exception("chat ref_frame failed")
             return f"Composition-reference generation failed: {e}", actions, touched
@@ -956,6 +968,8 @@ async def _execute_intent(
             s2 = await svc.write_prompts_after_layout(s.id)
             touched.add(s2.id)
             return f"The six-section H3 prompt for **{s2.title}** is ready. You can generate the video in Production.", actions, touched
+        except (LLMProviderError, ModelSelectionError):
+            raise
         except Exception as e:
             logger.exception("intent write_prompt failed")
             return f"Prompt writing failed: {e}", actions, touched
@@ -1173,15 +1187,35 @@ async def orchestrate_chat(
                 )
                 vision_b64 = list(pack.get("images_b64") or [])
                 vision_note = str(pack.get("note") or "")
+                if requested_layout_ids:
+                    included_captions = "\n".join(pack.get("captions") or [])
+                    missing_ids = [
+                        layout_id
+                        for layout_id in requested_layout_ids
+                        if not re.search(
+                            rf"(?<![A-Za-z0-9_-]){re.escape(layout_id)}(?![A-Za-z0-9_-])",
+                            included_captions,
+                        )
+                    ]
+                    if missing_ids:
+                        raise LLMProviderError(
+                            "Visual review could not include requested Layouts: "
+                            + ", ".join(missing_ids)
+                            + ". Check their image files and the four-image limit."
+                        )
                 if vision_b64:
                     actions.append(f"vision:{len(vision_b64)}")
                     await progress(
                         "status", f"Attached {len(vision_b64)} image{'s' if len(vision_b64) != 1 else ''} for the multimodal model"
                     )
                 else:
-                    await progress("status", vision_note or "No viewable images were found")
-        except Exception:
-            logger.exception("vision pack failed")
+                    raise LLMProviderError(vision_note or "No viewable images were found for visual review.")
+        except (LLMProviderError, ModelSelectionError):
+            raise
+        except Exception as exc:
+            raise LLMProviderError(
+                f"Visual review image preparation failed ({type(exc).__name__})."
+            ) from None
 
     user_uploads: list[dict[str, Any]] = [
         {
@@ -1247,25 +1281,12 @@ async def orchestrate_chat(
             )
     except GenerationActiveError:
         raise
-    except Exception as e:
-        logger.exception("chat llm failed")
-        await progress("runtime", f"Inference failed: {e}")
-        hint = (
-            "\nIf Comfy just generated an image, the GPU may still be busy or Ollama may need to reload its model. "
-            "Wait for composition or video jobs to finish, then retry, or POST /api/director/wake to warm the model.\n"
-        )
-        if vision_b64:
-            hint += (
-                "Visual review failed. Confirm that the selected model supports vision and that Ollama is current. "
-                "You can switch to a multimodal model or continue with text only.\n"
-            )
-        return finish(
-            f"Director inference is temporarily unavailable: {e}{hint}\n" + _status_summary(project, shots),
-            actions,
-            image_ids,
-        )
+    except Exception:
+        # The API records an error event/HTTP failure; never turn a rejected or
+        # incomplete completion into a successful assistant response.
+        raise
 
-    # Native Ollama tool loop. Each tool result is returned to the model so it
+    # Native provider tool loop. Each tool result is returned to the model so it
     # can produce a grounded final response after the state mutation succeeds.
     if isinstance(raw, dict):
         conversation: list[dict[str, Any]] = [
@@ -1379,16 +1400,22 @@ async def orchestrate_chat(
             conversation_tools = native_tools + [
                 tool for tool, _payload in unknown_tool_results
             ]
+            # Text-schema calls and deterministic pipeline additions also need IDs
+            # so every result can be correlated on the next standard chat turn.
+            for tool in conversation_tools:
+                if not tool.get("id"):
+                    tool["id"] = f"call_{uuid.uuid4().hex}"
             conversation.append(
                 {
                     "role": "assistant",
                     "content": native_content,
                     "tool_calls": [
                         {
+                            "id": tool["id"],
                             "type": "function",
                             "function": {
                                 "name": tool["name"],
-                                "arguments": tool.get("args") or {},
+                                "arguments": json.dumps(tool.get("args") or {}, ensure_ascii=False),
                             },
                         }
                         for tool in conversation_tools
@@ -1401,6 +1428,7 @@ async def orchestrate_chat(
                     conversation.append(
                         {
                             "role": "tool",
+                            "tool_call_id": tool["id"],
                             "tool_name": tool["name"],
                             "content": json.dumps(
                                 {
@@ -1447,6 +1475,7 @@ async def orchestrate_chat(
                 conversation.append(
                     {
                         "role": "tool",
+                        "tool_call_id": tool["id"],
                         "tool_name": tool["name"],
                         "content": json.dumps(
                             tool_payload,
@@ -1465,6 +1494,7 @@ async def orchestrate_chat(
                 conversation.append(
                     {
                         "role": "tool",
+                        "tool_call_id": tool["id"],
                         "tool_name": tool["name"],
                         "content": json.dumps(
                             unknown_payload,

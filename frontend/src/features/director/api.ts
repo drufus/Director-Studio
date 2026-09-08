@@ -390,6 +390,11 @@ export interface DirectorModelStatus {
   provider?: string;
   reachable?: boolean;
   available?: string[];
+  error?: string | null;
+  capabilities?: {
+    vision: boolean;
+    vision_reason: string;
+  };
 }
 
 export async function getDirectorModel(): Promise<DirectorModelStatus> {

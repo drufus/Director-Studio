@@ -45,7 +45,7 @@ export function generationStatusText(
     (left, right) => Date.parse(left.queued_at) - Date.parse(right.queued_at),
   );
   const active = jobs[0];
-  if (!status.chat_locked || !active) return "";
+  if (!active) return "";
   const elapsed = formatGenerationElapsed(active.queued_at, now);
   const waiting = Math.max(0, status.generation_count - 1);
   const suffix = waiting > 0 ? ` · ${waiting} ${waiting === 1 ? "job" : "jobs"} waiting` : "";

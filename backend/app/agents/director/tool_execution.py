@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ...config import settings
+from ...core.llm import LLMProviderError
+from ...core.vram.director_model import ModelSelectionError
 from ...core.library.store import load_asset
 from ...core.projects.layouts import (
     GptLayoutBrief,
@@ -225,6 +227,10 @@ async def execute_tools(
             ):
                 continue
             notes.append(f"Unknown tool: {name}")
+        except (LLMProviderError, ModelSelectionError):
+            # An unavailable provider is not a bad tool argument or a rejected
+            # storyboard candidate that another inference turn can repair.
+            raise
         except Exception as e:
             logger.exception("tool %s failed", name)
             notes.append(f"{name} failed: {e}")

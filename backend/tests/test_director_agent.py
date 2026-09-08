@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.config import settings
+from app.core.llm import LLMProviderError
+from app.core.vram.director_model import ModelSelectionError
 from app.core.projects import LayoutBrief, LayoutSourceRef, RefRole
 from app.core.projects.models import AgentContext, PromptSections, ShotStatus
 from app.core.projects.store import (
@@ -1303,7 +1305,7 @@ async def test_save_storyboard_runs_real_provider_and_storyboard_validation_guid
 ):
     from app.agents.director.planner import ShotDraft
     from app.agents.director.service import DirectorService, _script_hash
-    from app.api.projects import OllamaPlanProvider
+    from app.api.projects import DirectorPlanProvider
 
     actor = _seed_actor_asset(director_dirs["library"])
     scene = _seed_scene_asset(director_dirs["library"])
@@ -1339,7 +1341,7 @@ async def test_save_storyboard_runs_real_provider_and_storyboard_validation_guid
             prompts.append(prompt)
             return json.dumps({"valid": True, "issues": []})
 
-    provider = OllamaPlanProvider(model="qwen-test")
+    provider = DirectorPlanProvider(model="qwen-test")
     provider.client = _Client()
     svc = DirectorService(
         plan_provider=provider,
@@ -1367,8 +1369,10 @@ async def test_save_storyboard_runs_real_provider_and_storyboard_validation_guid
 
 
 @pytest.mark.asyncio
-async def test_ollama_plan_provider_requires_real_vision_for_layout_analysis():
-    from app.api.projects import OllamaPlanProvider
+async def test_director_plan_provider_requires_real_vision_for_layout_analysis(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "llm_vision_models", "qwen-vision-test")
+    from app.api.projects import DirectorPlanProvider
 
     calls: list[dict] = []
 
@@ -1380,7 +1384,7 @@ async def test_ollama_plan_provider_requires_real_vision_for_layout_analysis():
             calls.append({"model": model, "prompt": prompt, **kwargs})
             return "visible layout analysis"
 
-    provider = OllamaPlanProvider(model="qwen-vision-test")
+    provider = DirectorPlanProvider(model="qwen-vision-test")
     provider.client = _Client()
 
     result = await provider.complete_with_images(
@@ -1747,8 +1751,15 @@ async def test_context_saved_before_comfy(director_dirs, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_visual_direction_failure_is_non_blocking_without_starting_job(
-    director_dirs, monkeypatch
+@pytest.mark.parametrize("failure", [
+    ValueError("model returned invalid JSON"),
+    LLMProviderError("openai_compatible model 'verified-model', HTTP 401: authentication rejected"),
+    LLMProviderError("Image support has not been verified for the selected model."),
+    LLMProviderError("openai_compatible model 'verified-model': request timed out"),
+    ModelSelectionError("Director model selection file is malformed; repair it explicitly."),
+])
+async def test_visual_direction_records_failure_without_starting_job(
+    director_dirs, monkeypatch, failure
 ):
     import app.agents.director.service as service_mod
     from app.agents.director.service import DirectorService
@@ -1775,7 +1786,7 @@ async def test_visual_direction_failure_is_non_blocking_without_starting_job(
         started.append(job.id)
 
     async def fail_analyze(*args, **kwargs):
-        raise ValueError("model returned invalid JSON")
+        raise failure
 
     svc = DirectorService(
         plan_provider=FakePlanProvider(response="[]"),
@@ -1796,10 +1807,15 @@ async def test_visual_direction_failure_is_non_blocking_without_starting_job(
     monkeypatch.setattr(service_mod, "start_pipeline_job", fake_start)
     monkeypatch.setattr(service_mod, "get_director_model", lambda: "qwen3.6:27b")
 
-    result = await svc.queue_ref_frames(project.id, shot_ids=[shot.id])
+    if isinstance(failure, (LLMProviderError, ModelSelectionError)):
+        with pytest.raises(type(failure)) as caught:
+            await svc.queue_ref_frames(project.id, shot_ids=[shot.id])
+        assert caught.value is failure
+    else:
+        result = await svc.queue_ref_frames(project.id, shot_ids=[shot.id])
+        assert len(result) == 1
 
     assert started == []
-    assert len(result) == 1
     fresh = load_shot(project.id, shot.id)
     assert fresh is not None
     assert fresh.status == ShotStatus.ref_frame_pending
@@ -1807,7 +1823,7 @@ async def test_visual_direction_failure_is_non_blocking_without_starting_job(
     assert fresh.blocked_reasons == []
     issues = fresh.meta["layout_generation_issues"]
     assert "visual direction failed" in issues[0]
-    assert "invalid JSON" in issues[0]
+    assert str(failure) in issues[0]
     assert ("release_llm",) in svc.orchestrator.calls
 
 

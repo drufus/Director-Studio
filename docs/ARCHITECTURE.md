@@ -8,16 +8,16 @@ Extensible layout for pre-production assets, Director Agent, dual human gates, a
 - **Assets are first-class** — typed library entries with IDs, not loose images.
 - **Jobs are generic** — any pipeline runs through the same upload → queue → poll → save path.
 - **Video is pure H3 Ref2AV** — `MiniMaxH3ReferenceToVideo` only; layout first frame is a library ref (Picture 1), never I2V `first_frame`.
-- **Exclusive VRAM** — unload Ollama before Comfy image/video jobs; agent context lives on disk across swaps.
+- **GPU policy** — independent remote planning permits chat during renders without model eviction; explicit local exclusive mode swaps Ollama/Comfy residency. Agent context lives on disk.
 
 ## Backend layout
 
 ```
 backend/app/
   main.py                 # create_app(), mount routers
-  config.py               # DS_* settings (Comfy, Ollama, VRAM policy, paths)
+  config.py               # DS_* settings (Comfy, LLM provider, GPU policy, paths)
   api/                    # cross-cutting HTTP
-    health.py             # /api/health (comfy + ollama_reachable)
+    health.py             # /api/health (Comfy + configured LLM/model readiness)
     files.py
     pipelines.py
     projects.py           # Project/Shot + Director gates + H3 submit
@@ -27,7 +27,8 @@ backend/app/
     library/              # multi-kind asset library
     projects/             # Project + Shot models, disk store, state transitions
     h3/                   # prompt compose/validate, frame length helpers
-    vram/                 # exclusive Ollama ↔ Comfy orchestrator + OllamaClient
+    llm/                  # provider/client contract, OpenAI-compatible and Ollama adapters
+    vram/                 # independent/exclusive policy + scoped model persistence
     schemas.py            # JobRecord, LibraryAsset, JobStatus, HealthResponse, …
   agents/
     director/             # plan script, queue first frames, write six-section prompt
@@ -85,7 +86,7 @@ data/
       project.json
       shots/<sht_id>.json
       agent/
-        context.json  # Director context survives Ollama unload
+        context.json  # Director context survives provider sessions
 ```
 
 ## Projects, shots, and dual gates
@@ -108,7 +109,7 @@ API: `/api/projects/*` (create, plan, queue first frame, approve/reject layout, 
 
 ## Director Agent (`agents/director`)
 
-Local agent (Ollama) that:
+Agent using the explicitly selected LLM provider/model that:
 
 1. Plans shots from script text (ref matching against library kinds).
 2. Queues layout first-frame jobs (persists context → `release_llm` → Comfy).
@@ -117,6 +118,8 @@ Local agent (Ollama) that:
 Does **not** call Comfy for long runs directly; uses job runner + pipelines so artifacts match Casting/Set Design.
 
 ## VRAM orchestration (`core/vram`)
+
+OpenAI-compatible providers use independent mode: reservation tracking continues, chat admission stays open, readiness checks the exact model against the catalog, and automatic residency operations are no-ops. The table below describes the retained local exclusive path. See [provider configuration and inference contracts](LLM-PROVIDERS.md).
 
 | API | Behavior |
 |-----|----------|
@@ -199,7 +202,7 @@ Graph order: **master → full-body three-view → bust three-view** (bust from 
 | Costume / Props | New `pipelines/*` | not built |
 | Director Agent | `agents/director` + projects API + Director UI | **implemented** |
 | H3 Ref2AV + first frame | `pipelines/h3_ref2va`, `pipelines/first_frame` | **implemented** |
-| VRAM exclusive swap | `core/vram` + job runner hook | **implemented** |
+| Independent/exclusive GPU policy | `core/vram` + job runner hook + chat API/UI | **implemented** |
 | Project / Shot dual gates | `core/projects` + Production UI | **implemented** |
 | Production review | `features/production` | **implemented** |
 
@@ -208,4 +211,4 @@ Graph order: **master → full-body three-view → bust three-view** (bust from 
 Actor HTTP API remains under `/api/actors/*` with the same response shapes as v0.1.  
 Internally jobs are generic (`pipeline_id`, `params`, `outputs` map).
 
-Projects: `/api/projects/*` · pipelines list: `GET /api/pipelines` · health: `GET /api/health` (`details.ollama_reachable`).
+Projects: `/api/projects/*` · pipelines list: `GET /api/pipelines` · health: `GET /api/health` (`details.llm_provider`, `details.llm_reachable`, `details.llm_model_available`).

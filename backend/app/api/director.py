@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import asdict
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from ..agents.director.context_io import load_agent_context
 from ..config import settings
-from ..core.llm import LLMProvider, get_llm_provider
+from ..core.comfy import ComfyClient
+from ..core.llm import LLMProvider, LLMProviderError, get_llm_provider, public_llm_error
 from ..core.vram import get_director_model, get_orchestrator
-
-logger = logging.getLogger("director_studio.api.director")
+from ..core.vram.director_model import ModelSelectionError
+from ..core.vram.orchestrator import GPUBusyError
 
 router = APIRouter(tags=["director"])
 
@@ -40,33 +41,64 @@ class WakeResponse(BaseModel):
 
 
 class DirectorModelBody(BaseModel):
-    model: str = Field(..., min_length=1, description="Ollama model tag, e.g. ornith:35b")
+    model: str = Field(..., min_length=1, description="Exact model ID from the configured provider")
     persist: bool = Field(
         default=True,
         description="Write choice to data/director_model.json (survives process restart).",
     )
 
 
-@router.get("/director/model")
-async def get_model(provider: LLMProvider = Depends(get_llm_provider)) -> dict:
-    """Current Director LLM and the active provider's model catalog."""
-    status = provider.model_status()
-    reachable = True
+def _public_error(error: Exception, operation: str) -> str:
+    """Only dedicated public exceptions may supply unredacted error messages."""
+    if isinstance(error, (LLMProviderError, ModelSelectionError)):
+        return public_llm_error(error)
+    if isinstance(error, GPUBusyError):
+        return str(error)
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"{operation} failed (HTTP {error.response.status_code})."
+    if isinstance(error, httpx.TimeoutException):
+        return f"{operation} timed out."
+    if isinstance(error, httpx.ConnectError):
+        return f"{operation} failed to connect."
+    # Raw HTTP exceptions can embed request URLs, credentials, or response bodies.
+    return f"{operation} failed ({type(error).__name__})."
+
+
+def _model_response(
+    provider: LLMProvider, available: list[str], *, catalog_error: str | None = None
+) -> dict:
+    selection_error = None
     try:
-        available = await provider.list_models()
-    except Exception as e:
-        logger.warning("list %s models failed: %s", provider.provider_id, e)
-        available = []
-        reachable = False
-    if reachable and not str(status.get("model") or "").strip() and available:
-        provider.select_model(available[0], persist=True)
         status = provider.model_status()
+    except Exception as exc:
+        selection_error = _public_error(exc, "Director model selection read")
+        status = {"model": "", "source": "error"}
+    model = str(status.get("model") or "").strip()
+    if not selection_error and not catalog_error and model and model not in available:
+        selection_error = (
+            f"Selected Director model {model!r} is not served by provider "
+            f"{provider.provider_id!r}. Select an available model."
+        )
     return {
         **status,
         "provider": provider.provider_id,
-        "reachable": reachable,
+        "reachable": catalog_error is None,
         "available": available,
+        "error": "; ".join(filter(None, [selection_error, catalog_error])) or None,
+        "capabilities": provider.capabilities(model),
     }
+
+
+@router.get("/director/model")
+async def get_model(provider: LLMProvider = Depends(get_llm_provider)) -> dict:
+    """Current selection and catalog; discovery never selects or persists a model."""
+    try:
+        available = await provider.list_models()
+    except Exception as exc:
+        return _model_response(
+            provider, [], catalog_error=_public_error(exc, "Director model discovery")
+        )
+    return _model_response(provider, available)
 
 
 @router.put("/director/model")
@@ -75,24 +107,34 @@ async def put_model(
     provider: LLMProvider = Depends(get_llm_provider),
 ) -> dict:
     """Hot-switch Director plan model without restarting the backend."""
+    name = body.model.strip()
+    if not name:
+        raise HTTPException(400, "Director model ID must not be blank.")
     try:
-        name = provider.select_model(body.model, persist=body.persist)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
+        available = await provider.list_models()
+    except Exception as exc:
+        raise HTTPException(503, _public_error(exc, "Director model discovery")) from None
+    if name not in available:
+        raise HTTPException(
+            400,
+            f"Director model {name!r} is not served by provider {provider.provider_id!r}.",
+        )
+    try:
+        provider.select_model(name, persist=body.persist)
+    except Exception as exc:
+        raise HTTPException(400, _public_error(exc, "Director model selection")) from None
     return {
         "ok": True,
-        **provider.model_status(),
-        "provider": provider.provider_id,
-        "model": name,
+        **_model_response(provider, available),
     }
 
 
 @router.post("/director/wake", response_model=WakeResponse)
 async def wake_director(body: WakeBody | None = None) -> WakeResponse:
     """
-    Wake local Ollama plan model after Comfy generation.
+    Check the selected model and optionally reload a project's agent context.
 
-    Use before the next plan / rewrite_prompt turn when VRAM was given to Comfy.
+    Warming and release apply only when the configured policy shares one GPU.
     """
     body = body or WakeBody()
     orch = get_orchestrator()
@@ -118,17 +160,16 @@ async def wake_director(body: WakeBody | None = None) -> WakeResponse:
                     },
                     ensure_ascii=False,
                 )
-                agent_reply = await orch.ollama.generate(
+                agent_reply = await get_llm_provider().client.generate(
                     model,
-                    "You are the Director Studio local agent. "
+                    "You are the Director Studio agent. "
                     "Acknowledge context reload in one short sentence.\n"
                     f"CONTEXT:\n{summary}\n",
                 )
     except HTTPException:
         raise
-    except Exception as e:
-        logger.exception("wake_director failed")
-        raise HTTPException(503, f"wake failed: {e}") from e
+    except Exception as exc:
+        raise HTTPException(503, _public_error(exc, "Director wake")) from None
 
     return WakeResponse(
         ok=True,
@@ -136,7 +177,7 @@ async def wake_director(body: WakeBody | None = None) -> WakeResponse:
         project_id=body.project_id,
         last_phase=last_phase,
         agent_reply=(agent_reply or "").strip() or None,
-        llm_released=not body.keep,
+        llm_released=orch.shared_gpu_enabled and not body.keep,
     )
 
 
@@ -145,28 +186,30 @@ async def vram_status() -> dict:
     orch = get_orchestrator()
     model = get_director_model()
     reservations = await orch.generation_reservations()
-    ollama_vram = 0
+    ollama_vram: int | None = None
     ollama_loaded: list[dict] = []
-    try:
-        ollama_loaded = await orch.ollama.loaded_models()
-        ollama_vram = await orch.ollama.model_vram_bytes(model)
-    except Exception:
-        pass
-    # Re-sync flag with reality (process restart / external unload can desync it)
-    if ollama_vram > 0:
-        orch._llm_ready = True
-    elif orch._llm_ready and ollama_vram <= 0:
-        orch._llm_ready = False
+    vram_error = None
+    if orch.shared_gpu_enabled:
+        try:
+            ollama_loaded = await orch.ollama.loaded_models()
+            ollama_vram = await orch.ollama.model_vram_bytes(model)
+        except Exception as exc:
+            vram_error = _public_error(exc, "Ollama VRAM status")
+        if ollama_vram is not None:
+            # Re-sync shared GPU residency after an external unload or restart.
+            orch._llm_ready = ollama_vram > 0
     return {
         "owner": orch.owner,
         "comfy_pipeline": orch.comfy_pipeline,
         "policy": orch.policy,
+        "shared_gpu_enabled": orch.shared_gpu_enabled,
         "models": list(orch.models),
         "model": model,
         "llm_ready": orch._llm_ready,
-        "llm_keep_loaded": bool(getattr(settings, "llm_keep_loaded", True)),
+        "llm_keep_loaded": orch.shared_gpu_enabled and settings.llm_keep_loaded,
         "ollama_size_vram": ollama_vram,
-        "ollama_on_gpu": ollama_vram > 0,
+        "ollama_on_gpu": ollama_vram > 0 if ollama_vram is not None else None,
+        "error": vram_error,
         "ollama_ps": [
             {
                 "name": m.get("name"),
@@ -176,7 +219,7 @@ async def vram_status() -> dict:
             for m in ollama_loaded
         ],
         "queue_waiters": getattr(orch, "_waiters", 0),
-        "chat_locked": bool(reservations),
+        "chat_locked": orch.shared_gpu_enabled and bool(reservations),
         "generation_count": len(reservations),
         "generation_jobs": [asdict(item) for item in reservations],
         "acquire_timeout_sec": orch.acquire_timeout_sec,
@@ -187,10 +230,13 @@ async def vram_status() -> dict:
 
 @router.post("/director/free-comfy")
 async def free_comfy_models() -> dict:
-    """Force ComfyUI unload_models + free_memory (same as Plan does)."""
+    """Explicit user action to unload ComfyUI models, independent of auto policy."""
     orch = get_orchestrator()
     try:
-        stats = await orch.release_comfy_models(require_ok=True)
-    except Exception as e:
-        raise HTTPException(503, f"Comfy free failed: {e}") from e
+        if orch.shared_gpu_enabled:
+            stats = await orch.release_comfy_models(require_ok=True)
+        else:
+            stats = await ComfyClient().free_memory(unload_models=True, free_memory=True)
+    except Exception as exc:
+        raise HTTPException(503, _public_error(exc, "Comfy model release")) from None
     return {"ok": True, "stats": stats}

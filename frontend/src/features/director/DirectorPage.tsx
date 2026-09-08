@@ -20,6 +20,7 @@ import {
   setDirectorModel,
   type ChatMessage,
   type DirectorChatSessionStatus,
+  type DirectorModelStatus,
 } from "./api";
 import {
   generationStatusText,
@@ -145,6 +146,7 @@ export interface DirectorChatRequest {
   id: string;
   projectId: string;
   message: string;
+  requiresVision?: boolean;
 }
 
 export function DirectorPage({
@@ -199,6 +201,9 @@ function DirectorAgentWorkspace({
   const [llmOptions, setLlmOptions] = useState<string[]>([]);
   const [llmProvider, setLlmProvider] = useState("LLM provider");
   const [llmReachable, setLlmReachable] = useState(false);
+  const [llmLoaded, setLlmLoaded] = useState(false);
+  const [llmError, setLlmError] = useState<string | null>(null);
+  const [llmCapabilities, setLlmCapabilities] = useState<DirectorModelStatus["capabilities"]>();
   const [llmBusy, setLlmBusy] = useState(false);
   const [chatSession, setChatSession] = useState<DirectorChatSessionStatus>(IDLE_CHAT_SESSION);
   const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
@@ -208,11 +213,28 @@ function DirectorAgentWorkspace({
   const shotRevision = useRef(0);
   const handledRequestId = useRef<string | null>(null);
   const generationLocked = vramStatus?.chat_locked === true;
+  const hasGenerationJobs = Boolean(vramStatus?.generation_jobs.length);
   const chatActive = chatSession.active;
-  const chatDisabled = busy || generationLocked || chatActive || !llmModel;
+  const modelAvailable = llmReachable && !llmError && Boolean(llmModel) && llmOptions.includes(llmModel);
+  const chatDisabled = busy || llmBusy || generationLocked || chatActive || !modelAvailable;
+  const modelPickerDisabled = busy || llmBusy || generationLocked || chatActive || !llmReachable || llmOptions.length === 0;
+  const visionAvailable = modelAvailable && llmCapabilities?.vision === true;
+  const imageSendBlocked = pendingImages.length > 0 && !visionAvailable;
+  const modelSelectionIssue = !llmLoaded ? "Loading Director models…"
+    : llmError ? llmError
+    : !llmReachable ? `${llmProvider} model catalog is unavailable.`
+    : !llmModel ? "No Director model selected. Choose a model to enable chat and planning."
+    : !llmOptions.includes(llmModel) ? `Selected model ${llmModel} is not served by ${llmProvider}. Choose an available model.`
+    : null;
+  const visionReason = modelSelectionIssue || llmCapabilities?.vision_reason
+    || `Image support has not been verified for ${llmModel}.`;
 
   const addChatImages = (files: FileList | null) => {
     if (!files?.length) return;
+    if (!visionAvailable) {
+      setError(visionReason);
+      return;
+    }
     const available = MAX_CHAT_IMAGES - pendingImages.length;
     const selected = Array.from(files).slice(0, available);
     const invalid = selected.find(
@@ -258,18 +280,30 @@ function DirectorAgentWorkspace({
     );
   }, [shots]);
 
+  const applyLlmStatus = useCallback((status: DirectorModelStatus) => {
+    setLlmModel(status.model || "");
+    setLlmProvider(status.provider || "LLM provider");
+    setLlmReachable(status.reachable === true);
+    setLlmOptions([...(status.available || [])]);
+    setLlmCapabilities(status.capabilities);
+    setLlmError(status.error || null);
+    setLlmLoaded(true);
+  }, []);
+
   const loadLlmModels = useCallback(async () => {
+    setLlmBusy(true);
     try {
-      const st = await getDirectorModel();
-      setLlmModel(st.model || "");
-      setLlmProvider(st.provider || "LLM provider");
-      setLlmReachable(st.reachable !== false);
-      setLlmOptions([...(st.available || [])]);
-    } catch {
+      applyLlmStatus(await getDirectorModel());
+    } catch (cause) {
       setLlmReachable(false);
       setLlmOptions([]);
+      setLlmCapabilities(undefined);
+      setLlmError(`Could not load Director models: ${cause instanceof Error ? cause.message : String(cause)}`);
+      setLlmLoaded(true);
+    } finally {
+      setLlmBusy(false);
     }
-  }, []);
+  }, [applyLlmStatus]);
 
   useEffect(() => {
     void loadLlmModels();
@@ -300,19 +334,17 @@ function DirectorAgentWorkspace({
   }, [projectId, refreshVramStatus]);
 
   useEffect(() => {
-    if (!generationLocked) return;
+    if (!hasGenerationJobs) return;
     const timer = window.setInterval(() => setClockNow(new Date()), 1000);
     return () => window.clearInterval(timer);
-  }, [generationLocked]);
+  }, [hasGenerationJobs]);
 
   const onChangeLlm = async (model: string) => {
     if (!model || model === llmModel) return;
     setLlmBusy(true);
     setError(null);
     try {
-      const st = await setDirectorModel(model, true);
-      setLlmModel(st.model);
-      if (st.available?.length) setLlmOptions(st.available);
+      applyLlmStatus(await setDirectorModel(model, true));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -468,6 +500,10 @@ function DirectorAgentWorkspace({
     const typedMessage = (text ?? draft).trim();
     const message = typedMessage || (pendingImages.length ? "Please analyze the attached image(s)." : "");
     if (!message || chatDisabled) return;
+    if (imageSendBlocked) {
+      setError(`${visionReason} Remove the attached images or select a model with verified image support.`);
+      return;
+    }
     if (!projectId) {
       setBusy(true);
       setError(null);
@@ -644,11 +680,19 @@ function DirectorAgentWorkspace({
       || handledRequestId.current === requestedMessage.id
     ) return;
     handledRequestId.current = requestedMessage.id;
+    if (requestedMessage.requiresVision && !visionAvailable) {
+      setError(`Cannot start the requested visual review: ${visionReason} Select a model with verified image support and request the review again.`);
+      return;
+    }
     void send(requestedMessage.message);
-  }, [requestedMessage, projectId, loadedProjectId, chatDisabled]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [requestedMessage, projectId, loadedProjectId, chatDisabled, visionAvailable, visionReason]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const regenerateReferenceFrame = async (shot: Shot) => {
-    if (busy) return;
+    if (!visionAvailable) {
+      setError(visionReason);
+      return;
+    }
+    if (chatDisabled) return;
     setBusy(true);
     setError(null);
     setLiveStatus([`Queueing reference frame: ${shot.title}`]);
@@ -689,7 +733,7 @@ function DirectorAgentWorkspace({
   const chips = [
     { label: "Project status", text: "status" },
     { label: "Plan shots", text: "plan" },
-    { label: "Generate references", text: "reference frame all" },
+    { label: "Generate references", text: "reference frame all", requiresVision: true },
   ];
   const selectedShotIndex = Math.max(0, shots.findIndex((shot) => shot.id === selectedShotId));
   const selectedShot = shots[selectedShotIndex] ?? null;
@@ -717,7 +761,7 @@ function DirectorAgentWorkspace({
               <span className="muted tiny">LLM</span>
               <select
                 value={llmOptions.length ? llmModel : ""}
-                disabled={chatDisabled || llmBusy || llmOptions.length === 0}
+                disabled={modelPickerDisabled}
                 onChange={(e) => void onChangeLlm(e.target.value)}
                 title={`${llmProvider} model used for Director chat and shot planning`}
               >
@@ -725,6 +769,7 @@ function DirectorAgentWorkspace({
                   <option value="">{llmReachable ? "No models available" : `${llmProvider} unavailable`}</option>
                 ) : (
                   <>
+                    <option value="" disabled>Select a model</option>
                     {llmModel && !llmOptions.includes(llmModel) ? (
                       <option value={llmModel} disabled>{llmModel} (not available)</option>
                     ) : null}
@@ -747,8 +792,28 @@ function DirectorAgentWorkspace({
         {error ? <div className="banner error">{error}</div> : null}
         {pollError ? <div className="banner error" role="alert" aria-live="polite">{pollError}</div> : null}
         {vramPollError ? <div className="banner error" role="alert" aria-live="polite">{vramPollError}</div> : null}
+        {modelSelectionIssue ? (
+          <div className={`banner${llmLoaded ? " error" : ""}`} role={llmLoaded ? "alert" : "status"}>
+            {modelSelectionIssue}
+            {llmLoaded ? (
+              <button type="button" className="mode-chip" disabled={llmBusy || busy || chatActive} onClick={() => void loadLlmModels()}>
+                Refresh models
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+        {modelAvailable && !visionAvailable ? (
+          <div className="banner" role="status">
+            Visual direction and layout analysis are unavailable: {visionReason}
+          </div>
+        ) : null}
+        {imageSendBlocked ? (
+          <div className="banner error" role="alert">
+            Attached images require a model with verified image support. Remove the images or change models before sending.
+          </div>
+        ) : null}
 
-        {generationLocked && vramStatus ? (
+        {hasGenerationJobs && vramStatus ? (
           <div className="director-generation-status" role="status" aria-live="polite">
             <span className="director-generation-dot" aria-hidden="true" />
             <span>{generationStatusText(vramStatus, clockNow)}</span>
@@ -836,7 +901,8 @@ function DirectorAgentWorkspace({
               key={c.label}
               type="button"
               className="mode-chip"
-              disabled={chatDisabled}
+              disabled={chatDisabled || imageSendBlocked || (c.requiresVision && !visionAvailable)}
+              title={c.requiresVision && !visionAvailable ? visionReason : undefined}
               onClick={() => void send(c.text)}
             >
               {c.label}
@@ -846,7 +912,7 @@ function DirectorAgentWorkspace({
             <button
               type="button"
               className="mode-chip prompt-shortcut"
-              disabled={chatDisabled}
+              disabled={chatDisabled || imageSendBlocked}
               onClick={() => void send(`Write the H3 prompt for shot ${selectedShotIndex + 1}`)}
             >
               Write H3 prompt · Shot {String(selectedShotIndex + 1).padStart(2, "0")}
@@ -863,7 +929,7 @@ function DirectorAgentWorkspace({
                 <button
                   type="button"
                   aria-label={`Remove ${image.file.name}`}
-                  disabled={chatDisabled}
+                  disabled={busy || chatActive}
                   onClick={() => removeChatImage(index)}
                 >
                   ×
@@ -875,15 +941,15 @@ function DirectorAgentWorkspace({
 
         <div className="chat-composer">
           <label
-            className={`chat-upload-btn${!projectId || chatDisabled || pendingImages.length >= MAX_CHAT_IMAGES ? " disabled" : ""}`}
-            title={projectId ? "Add up to 4 images" : "Select a project before adding images"}
+            className={`chat-upload-btn${!projectId || chatDisabled || !visionAvailable || pendingImages.length >= MAX_CHAT_IMAGES ? " disabled" : ""}`}
+            title={!visionAvailable ? visionReason : projectId ? "Add up to 4 images" : "Select a project before adding images"}
           >
             <input
               type="file"
               accept="image/jpeg,image/png,image/webp"
               multiple
               aria-label="Add images"
-              disabled={!projectId || chatDisabled || pendingImages.length >= MAX_CHAT_IMAGES}
+              disabled={!projectId || chatDisabled || !visionAvailable || pendingImages.length >= MAX_CHAT_IMAGES}
               onChange={(event) => {
                 addChatImages(event.target.files);
                 event.target.value = "";
@@ -921,7 +987,7 @@ function DirectorAgentWorkspace({
             <button
               type="button"
               className="btn primary"
-              disabled={chatDisabled || (!draft.trim() && pendingImages.length === 0)}
+              disabled={chatDisabled || imageSendBlocked || (!draft.trim() && pendingImages.length === 0)}
               onClick={() => void send()}
             >
               Send
@@ -933,7 +999,8 @@ function DirectorAgentWorkspace({
   const shotPanel = (
     <ShotWorkspace
       shots={shots}
-      busy={busy}
+      busy={chatDisabled}
+      visualDisabledReason={!visionAvailable ? visionReason : undefined}
       onRegenerate={(shot) => void regenerateReferenceFrame(shot)}
       onSend={(message) => void send(message)}
       onSelectShot={(shot) => setSelectedShotId(shot.id)}

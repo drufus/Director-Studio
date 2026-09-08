@@ -50,7 +50,8 @@ from ...core.projects.store import (
 )
 from ...core.schemas import JobStatus, LibraryAsset
 from ...core.vram import get_director_model, get_orchestrator
-from ...core.vram.ollama_client import OllamaClient
+from ...core.llm import LLMProviderError, get_llm_provider
+from ...core.vram.director_model import ModelSelectionError
 from .context_io import load_agent_context, save_agent_context
 from .visual_direction import analyze_ref_frame
 from .planner import (
@@ -714,10 +715,10 @@ class DirectorService:
         index = _asset_index(project_id)
         library_json = json.dumps(inventory, indent=2)
 
-        # Plan path: queue for GPU, free Comfy image/video weights, then run Ollama.
+        # The policy decides whether planning requires a shared-GPU handoff.
         # release_comfy_models is also invoked inside llm_session; call once more
         # up-front for clear logging when users click Plan after a gen job.
-        logger.info("plan_project %s: acquiring LLM GPU (will unload Comfy models)", project_id)
+        logger.info("plan_project %s: requesting Director session", project_id)
         keep = bool(getattr(settings, "llm_keep_loaded", True))
         async with self.orchestrator.llm_session(release_on_exit=not keep):
             free_stats = getattr(self.orchestrator, "last_comfy_free", None)
@@ -1012,7 +1013,7 @@ class DirectorService:
                     review_image=review_image,
                     feedback=direction_feedback,
                     model=model,
-                    ollama=OllamaClient(),
+                    ollama=get_llm_provider().client,
                 )
         except Exception as exc:
             await self.orchestrator.release_llm()
@@ -1020,6 +1021,10 @@ class DirectorService:
             unavailable = _record_layout_generation_issue(shot, [reason])
             save_shot(unavailable)
             logger.exception("ref_frame visual direction failed for %s", shot.id)
+            # Provider outages and unsupported vision must reach the caller as
+            # failures; a returned Shot would be mistaken for newly queued work.
+            if isinstance(exc, (LLMProviderError, ModelSelectionError)):
+                raise
             return unavailable
 
         await self.orchestrator.release_llm()
@@ -1713,21 +1718,23 @@ class DirectorService:
                 encoded = image_bytes_to_b64_jpeg(pair[1]) if pair else None
                 if not encoded:
                     continue
-                analysis = await complete_with_images(
-                    (
-                        "Inspect one Director Studio Layout for H3 prompt grounding. "
-                        "Describe only visible composition, blocking, scale, eyelines, set geometry, "
-                        "handled props, and lighting. Do not invent story facts."
-                    ),
-                    (
-                        f"Shot: {shot.title}\n"
-                        f"Beat: {shot.script_beat}\n"
-                        f"Layout purpose: {layout.purpose}\n"
-                        "Return one concise paragraph describing what the Layout visibly establishes."
-                    ),
-                    images=[encoded],
-                    guides=("h3-prompt-writing",),
-                )
+                async with self.orchestrator.llm_session(release_on_exit=False):
+                    await self.orchestrator.ensure_llm_ready()
+                    analysis = await complete_with_images(
+                        (
+                            "Inspect one Director Studio Layout for H3 prompt grounding. "
+                            "Describe only visible composition, blocking, scale, eyelines, set geometry, "
+                            "handled props, and lighting. Do not invent story facts."
+                        ),
+                        (
+                            f"Shot: {shot.title}\n"
+                            f"Beat: {shot.script_beat}\n"
+                            f"Layout purpose: {layout.purpose}\n"
+                            "Return one concise paragraph describing what the Layout visibly establishes."
+                        ),
+                        images=[encoded],
+                        guides=("h3-prompt-writing",),
+                    )
                 cleaned = str(analysis or "").strip()
                 if cleaned:
                     layout_visual_analyses[asset_id] = {"analysis": cleaned}

@@ -1,13 +1,7 @@
-"""Wake local Director LLM after Comfy work (reload model + optional context).
+"""Check the selected Director provider and optionally reload project context.
 
-Usage (from backend/):
-  python -m app.scripts.wake_agent
-  python -m app.scripts.wake_agent --project prj_xxx
-  python -m app.scripts.wake_agent --release   # load then unload (smoke)
-  python -m app.scripts.wake_agent --keep      # load and leave resident
-
-Comfy jobs call release_llm before GPU work. Call this (or POST /api/director/wake)
-before the next plan / prompt-rewrite turn so Ollama is warm and context is reloaded.
+Local exclusive mode warms/releases Ollama; independent mode never changes
+LLM or Comfy residency. Run from backend with python -m app.scripts.wake_agent.
 """
 
 from __future__ import annotations
@@ -20,26 +14,26 @@ import sys
 
 async def _run(project_id: str | None, *, release: bool, keep: bool) -> int:
     from app.agents.director.context_io import load_agent_context
-    from app.config import settings
+    from app.core.llm import get_llm_provider
     from app.core.vram import get_orchestrator
 
     orch = get_orchestrator()
     from app.core.vram.director_model import get_director_model
 
+    provider = get_llm_provider()
     model = get_director_model()
-    print(f"wake: model={model} ollama={settings.ollama_base_url}", flush=True)
-    if orch.owner == "comfy":
+    print(f"wake: model={model} provider={provider.provider_id} policy={orch.policy}", flush=True)
+    if orch.shared_gpu_enabled and orch.owner == "comfy":
         print(
             f"wake: WARNING GPU owner=comfy pipeline={orch.comfy_pipeline}. "
             "Wait for Comfy job to finish (exclusive VRAM) or wake will be slow/timeout.",
             flush=True,
         )
 
-    # llm_session unloads Comfy models (POST /free) before warming Ollama
-    print("wake: unloading Comfy models then warming Ollama…", flush=True)
+    print("wake: checking selected model availability…", flush=True)
     async with orch.llm_session(release_on_exit=not keep and not release):
         await orch.ensure_llm_ready()
-        print("wake: LLM ready (Comfy freed + Ollama warm ok)", flush=True)
+        print("wake: selected model is available", flush=True)
 
 
         if project_id:
@@ -63,7 +57,7 @@ async def _run(project_id: str | None, *, release: bool, keep: bool) -> int:
                     },
                     ensure_ascii=False,
                 )
-                text = await orch.ollama.generate(
+                text = await provider.client.generate(
                     model,
                     "You are the Director Studio local agent. "
                     "Acknowledge context reload in one short sentence.\n"
@@ -71,7 +65,9 @@ async def _run(project_id: str | None, *, release: bool, keep: bool) -> int:
                 )
                 print(f"wake: agent reply: {text.strip()[:300]}", flush=True)
 
-        if release:
+        if not orch.shared_gpu_enabled:
+            print("wake: independent provider manages its own residency", flush=True)
+        elif release:
             await orch.release_llm()
             print("wake: released LLM (VRAM free for Comfy)", flush=True)
         elif keep:
@@ -84,7 +80,7 @@ async def _run(project_id: str | None, *, release: bool, keep: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Wake Director Ollama agent + reload context")
+    p = argparse.ArgumentParser(description="Check Director provider + reload context")
     p.add_argument("--project", help="Project id to reload agent/context.json for")
     p.add_argument(
         "--release",
