@@ -149,8 +149,8 @@ def test_raw_transport_error_never_leaks_into_model_response_or_logs(client, pro
 def health_dependencies(provider, monkeypatch):
     monkeypatch.setattr(health_api, "get_llm_provider", lambda: provider)
     monkeypatch.setattr(health_api.settings, "llm_provider", "openai_compatible")
-    comfy = SimpleNamespace(health=AsyncMock(return_value={"system": {"os": "linux"}}))
-    monkeypatch.setattr(health_api, "ComfyClient", lambda: comfy)
+    comfy = SimpleNamespace(status=AsyncMock(return_value=[{"id": "test", "status": "up", "error": None}]))
+    monkeypatch.setattr(health_api, "get_worker_registry", lambda: comfy)
     constructor = Mock(side_effect=AssertionError("Health must not construct Ollama"))
     monkeypatch.setattr(llm, "OllamaLLMProvider", constructor)
     yield comfy
@@ -196,7 +196,7 @@ async def test_provider_health_failure_is_specific(provider, health_dependencies
 
 @pytest.mark.asyncio
 async def test_comfy_health_failure_does_not_hide_llm_status(provider, health_dependencies):
-    health_dependencies.health.side_effect = httpx.ConnectError("PRIVATE_REQUEST_CONTENT_FOR_TEST")
+    health_dependencies.status.side_effect = httpx.ConnectError("PRIVATE_REQUEST_CONTENT_FOR_TEST")
     body = await health_api.health()
     assert body.ok is False
     assert body.comfy_reachable is False
@@ -207,7 +207,7 @@ async def test_comfy_health_failure_does_not_hide_llm_status(provider, health_de
 @pytest.mark.asyncio
 async def test_liveness_never_contacts_inference_providers(monkeypatch):
     forbidden = Mock(side_effect=AssertionError("Liveness must stay local"))
-    monkeypatch.setattr(health_api, "ComfyClient", forbidden)
+    monkeypatch.setattr(health_api, "get_worker_registry", forbidden)
     monkeypatch.setattr(health_api, "get_llm_provider", forbidden)
     assert await health_api.liveness() == {"ok": True}
     forbidden.assert_not_called()
@@ -241,8 +241,8 @@ async def test_manual_free_is_explicit_even_under_independent_policy(monkeypatch
     orch = SimpleNamespace(shared_gpu_enabled=False, release_comfy_models=AsyncMock())
     comfy = SimpleNamespace(free_memory=AsyncMock(return_value={"vram_free_gained": 5}))
     monkeypatch.setattr(director_api, "get_orchestrator", lambda: orch)
-    monkeypatch.setattr(director_api, "ComfyClient", lambda: comfy)
-    assert await director_api.free_comfy_models() == {
+    monkeypatch.setattr(director_api, "get_worker_registry", lambda: SimpleNamespace(client_for=lambda worker_id: comfy))
+    assert await director_api.free_comfy_models(worker_id="test") == {
         "ok": True, "stats": {"vram_free_gained": 5}
     }
     comfy.free_memory.assert_awaited_once_with(unload_models=True, free_memory=True)
@@ -254,8 +254,8 @@ async def test_manual_free_failure_is_not_success(monkeypatch):
     orch = SimpleNamespace(shared_gpu_enabled=False)
     comfy = SimpleNamespace(free_memory=AsyncMock(side_effect=httpx.ConnectError("private request")))
     monkeypatch.setattr(director_api, "get_orchestrator", lambda: orch)
-    monkeypatch.setattr(director_api, "ComfyClient", lambda: comfy)
+    monkeypatch.setattr(director_api, "get_worker_registry", lambda: SimpleNamespace(client_for=lambda worker_id: comfy))
     with pytest.raises(HTTPException) as error:
-        await director_api.free_comfy_models()
+        await director_api.free_comfy_models(worker_id="test")
     assert error.value.status_code == 503
     assert error.value.detail == "Comfy model release failed to connect."

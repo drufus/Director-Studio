@@ -72,10 +72,22 @@ class Pipeline(_PipelineCommon, ABC):
     and calling register_pipeline() in the package's __init__.
     """
 
-    # All local ComfyUI workflows use the MCP transport. External providers
+    # ComfyUI workflows use the selected worker's HTTP API. External providers
     # (GPT Bridge, MiniMax cloud API) declare their own adapters separately.
-    execution_adapter_id = "comfy_mcp"
+    execution_adapter_id = "comfy"
     generation_kind: Literal["image", "video"] = "image"
+
+    def prepare_upload_inputs(
+        self, job: JobRecord, inputs: dict[str, tuple[str, bytes]]
+    ) -> dict[str, tuple[str, bytes]]:
+        """Return all inputs to upload to the job's already selected worker."""
+        return dict(inputs)
+
+    def expected_output_manifest(
+        self, job: JobRecord, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Declare required artifacts before submission, independently of history."""
+        raise NotImplementedError(f"Pipeline {self.id} has no output artifact contract")
 
     @abstractmethod
     def build_prompt(

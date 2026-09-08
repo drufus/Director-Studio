@@ -14,7 +14,12 @@ _DEFAULT_DATA_DIR = runtime_paths.data_root
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DS_", env_file=".env", extra="ignore", hide_input_in_errors=True)
 
+    # Legacy exclusive-GPU control only; remote jobs always require a worker registry.
     comfy_base_url: str = "http://127.0.0.1:8188"
+    comfy_workers: str = ""
+    # Operators set workflow-specific minimum headroom before any H3 submission.
+    comfy_min_free_ram_gib: float | None = Field(default=None, gt=0)
+    comfy_min_free_vram_gib: float | None = Field(default=None, gt=0)
     host: str = "127.0.0.1"
     port: int = 8790
     reload: bool = False
@@ -38,7 +43,7 @@ class Settings(BaseSettings):
     max_upload_mb: int = 20
 
     # H3 execution provider. ``local`` runs the configured Comfy workflow via
-    # the official Comfy MCP transport; ``minimax`` uses the official
+    # the remote Comfy HTTP transport; ``minimax`` uses the official
     # asynchronous MiniMax H3 V2 API. ``mcp`` remains a legacy alias for local.
     h3_provider: str = "local"
     comfy_mcp_command: str = "comfy-mcp"

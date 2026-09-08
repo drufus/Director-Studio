@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,7 +95,20 @@ def save_job(job: JobRecord) -> None:
             d = found
     d.mkdir(parents=True, exist_ok=True)
     path = d / "job.json"
-    path.write_text(job.model_dump_json(indent=2), encoding="utf-8")
+    # A restart must see either complete record, including the submission boundary.
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=d, prefix=".job-", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = handle.name
+            handle.write(job.model_dump_json(indent=2))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def load_job(job_id: str) -> JobRecord | None:

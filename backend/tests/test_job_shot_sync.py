@@ -511,7 +511,8 @@ def test_ref_frame_library_save_failure_marks_exact_layout_terminal(
         lambda _pipeline_id: FailingPipeline(),
     )
 
-    on_pipeline_job_terminal(job)
+    with pytest.raises(RuntimeError, match="asset store is read-only"):
+        on_pipeline_job_terminal(job)
 
     updated = load_shot(project.id, shot.id)
     assert updated is not None
@@ -645,6 +646,17 @@ async def test_run_job_success_triggers_ref_frame_shot_sync(isolated_data, monke
         execution_adapter_id = "comfy"
         output_labels = {"layout": "Layout"}
 
+        def prepare_upload_inputs(self, job, inputs):
+            return inputs
+
+        def expected_output_manifest(self, job, prompt):
+            from app.core.comfy.artifacts import image_manifest
+
+            return image_manifest(prompt, {"1": ["layout"]})
+
+        def postprocess_job_outputs(self, job, saved):
+            pass
+
         def build_prompt(self, job, *, uploaded_images):
             return {"1": {}}, 42
 
@@ -676,12 +688,16 @@ async def test_run_job_success_triggers_ref_frame_shot_sync(isolated_data, monke
     fake_client = SimpleNamespace(
         upload_image=AsyncMock(return_value="up.png"),
         queue_prompt=AsyncMock(return_value="prompt-1"),
-        wait_for_completion=AsyncMock(return_value={"outputs": {}}),
+        wait_for_completion=AsyncMock(return_value={
+            "status": {"completed": True, "status_str": "success", "messages": []},
+            "outputs": {"1": {"images": [{"filename": "layout.png", "subfolder": "", "type": "output"}]}},
+        }),
         download_image=AsyncMock(return_value=b"png-from-comfy"),
     )
 
     monkeypatch.setattr(runner, "get_pipeline", lambda _pid: FakePipeline())
-    monkeypatch.setattr(runner, "ComfyClient", lambda: fake_client)
+    monkeypatch.setattr(runner, "_bind_worker", AsyncMock(return_value=fake_client))
+    monkeypatch.setattr(runner, "_release_worker", AsyncMock())
     monkeypatch.setattr(runner, "get_orchestrator", lambda: RecordingOrch())
 
     cancel = asyncio.Event()

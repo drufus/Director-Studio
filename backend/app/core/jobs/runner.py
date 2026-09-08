@@ -5,21 +5,18 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ...integrations.comfy_mcp import ComfyMcpClient
 from ...integrations.minimax_h3 import MiniMaxH3Client
 from ...pipelines.base import ExternalPipeline
 from ...pipelines.registry import get_pipeline
 from ..comfy import ComfyClient, ComfyError
+from ..comfy.artifacts import validate_history, validate_mapped_outputs
+from ..comfy.workers import get_worker_registry
 from ..paths import find_job_dir
 from ..schemas import JobRecord, JobStatus
 from ..vram import get_orchestrator
 from . import store
 from .execution import ExecutionAdapterRegistry
 from .execution_adapters.comfy import ComfyExecutionAdapter, ComfyExecutionRuntime
-from .execution_adapters.comfy_mcp import (
-    ComfyMcpExecutionAdapter,
-    ComfyMcpExecutionRuntime,
-)
 from .execution_adapters.external import ExternalExecutionAdapter
 from .execution_adapters.h3_api import H3ApiExecutionAdapter, H3ApiExecutionRuntime
 
@@ -28,14 +25,11 @@ logger = logging.getLogger("director_studio.jobs")
 _tasks: dict[str, asyncio.Task[None]] = {}
 _cancel_events: dict[str, asyncio.Event] = {}
 _comfy_execution_adapter = ComfyExecutionAdapter()
-_comfy_mcp_execution_adapter = ComfyMcpExecutionAdapter()
 _external_execution_adapter = ExternalExecutionAdapter()
 _h3_api_execution_adapter = H3ApiExecutionAdapter()
-_comfy_mcp_client = ComfyMcpClient()
 _execution_adapters = ExecutionAdapterRegistry(
     [
         _comfy_execution_adapter,
-        _comfy_mcp_execution_adapter,
         _external_execution_adapter,
         _h3_api_execution_adapter,
     ]
@@ -44,7 +38,9 @@ _execution_adapters = ExecutionAdapterRegistry(
 
 def _comfy_runtime() -> ComfyExecutionRuntime:
     return ComfyExecutionRuntime(
-        client_factory=ComfyClient,
+        bind_worker=_bind_worker,
+        release_worker=_release_worker,
+        admit_h3=_admit_h3,
         prepare=prepare_comfy,
         finish=finish_comfy,
         update_phase=update_generation_phase,
@@ -56,27 +52,28 @@ def _h3_api_runtime() -> H3ApiExecutionRuntime:
     return H3ApiExecutionRuntime(client_factory=MiniMaxH3Client)
 
 
-def _comfy_mcp_runtime() -> ComfyMcpExecutionRuntime:
-    return ComfyMcpExecutionRuntime(
-        client_factory=lambda: _comfy_mcp_client,
-        prepare=prepare_comfy,
-        finish=finish_comfy,
-    )
+async def _bind_worker(job: JobRecord, *, allow_selection: bool) -> ComfyClient:
+    return await get_worker_registry().bind_job(job, allow_selection=allow_selection)
+
+
+async def _release_worker(job_id: str) -> None:
+    await get_worker_registry().release_job(job_id)
+
+
+async def _admit_h3(job: JobRecord, client: ComfyClient) -> None:
+    await get_worker_registry().check_h3_admission(job, client)
 
 
 def _runtime_for(adapter: Any) -> Any:
     if adapter.id == "comfy":
         return _comfy_runtime()
-    if adapter.id == "comfy_mcp":
-        return _comfy_mcp_runtime()
     if adapter.id == "h3_api":
         return _h3_api_runtime()
     return None
 
 
 async def close_execution_runtimes() -> None:
-    """Release persistent protocol clients owned by the job runner."""
-    await _comfy_mcp_client.aclose()
+    """HTTP requests own their connections; no subprocess runtime is retained."""
 
 
 def _submission_id(adapter: Any, job: JobRecord) -> str | None:
@@ -87,16 +84,18 @@ def _submission_id(adapter: Any, job: JobRecord) -> str | None:
 
 
 def _can_replay(adapter: Any, pipeline: Any, job: JobRecord) -> bool:
+    if job.status not in {JobStatus.queued, JobStatus.uploading}:
+        return False
     checker = getattr(adapter, "can_replay_job", None)
     if callable(checker):
         return bool(checker(job))
     return bool(adapter.can_replay(pipeline))
 
 
-# All Comfy pipeline jobs use exclusive VRAM (unload LLM before queue).
-# Includes h3_ref2va (video), ref_frame (reference still), actor, scene, …
+# Shared-GPU deployments may opt into residency handoff. Independent workers
+# retain generation tracking without blocking Director chat or evicting models.
 EXCLUSIVE_PIPELINES: frozenset[str] | None = None  # None = all pipelines
-LOCAL_COMFY_ADAPTER_IDS = frozenset({"comfy", "comfy_mcp"})
+LOCAL_COMFY_ADAPTER_IDS = frozenset({"comfy"})
 
 
 def _uses_exclusive_vram(pipeline_id: str) -> bool:
@@ -106,11 +105,11 @@ def _uses_exclusive_vram(pipeline_id: str) -> bool:
 
 
 async def prepare_comfy(job: JobRecord) -> None:
-    """Claim exclusive GPU / unload Ollama before Comfy upload/queue (incl. video)."""
+    """Apply the configured GPU policy before upload and submission."""
     if not _uses_exclusive_vram(job.pipeline_id):
         return
     logger.info(
-        "prepare_comfy: unload LLM before pipeline=%s job=%s", job.pipeline_id, job.id
+        "prepare_comfy: apply GPU policy for pipeline=%s job=%s", job.pipeline_id, job.id
     )
     await get_orchestrator().before_comfy_job(job.pipeline_id)
 
@@ -157,6 +156,12 @@ async def start_pipeline_job(
 
     `images` maps logical input names (e.g. "actor", "wardrobe") to (filename, bytes).
     """
+    if job.id in _tasks:
+        raise ValueError(f"Job {job.id} is already running in this Director process")
+    if job.status not in {JobStatus.queued, JobStatus.uploading} or (
+        job.comfy_prompt_id or job.external_task_id
+    ):
+        raise ValueError(f"Job {job.id} cannot be submitted again; resume its recorded task")
     images = images or {}
     for kind, (filename, data) in images.items():
         store.save_input_file(job.id, kind, filename, data, project_id=job.project_id)
@@ -266,8 +271,10 @@ def _fail_job_preparation(job: JobRecord, exc: Exception) -> None:
         from .shot_sync import on_pipeline_job_terminal
 
         on_pipeline_job_terminal(job)
-    except Exception:
-        logger.exception("shot_sync failed for preparation failure %s", job.id)
+    except Exception as sync_exc:
+        job.error = f"{job.error}; Terminal shot synchronization failed: {sync_exc}"
+        store.save_job(job)
+        logger.error("shot_sync failed for preparation failure %s: %s", job.id, sync_exc)
 
 
 async def _recover_interrupted_job(job: JobRecord) -> bool:
@@ -279,18 +286,15 @@ async def _recover_interrupted_job(job: JobRecord) -> bool:
         return True
 
     if not _can_replay(adapter, pipeline, job):
-        job.status = JobStatus.failed
-        job.error = (
-            "Provider generation was interrupted and was not replayed because "
-            "submission may already have occurred. Ask the user to generate again."
+        location = "pinned worker queue/history" if adapter.id == "comfy" else "provider task history"
+        _fail_job_preparation(
+            job,
+            RuntimeError(
+                "Generation was interrupted without a recorded provider task ID. "
+                "Submission may already have occurred; it was not replayed. "
+                f"Inspect the {location} before asking to generate again."
+            ),
         )
-        store.save_job(job)
-        try:
-            from .shot_sync import on_pipeline_job_terminal
-
-            on_pipeline_job_terminal(job)
-        except Exception:
-            logger.exception("shot_sync failed for interrupted external job %s", job.id)
         return False
 
     directory = find_job_dir(job.id)
@@ -327,34 +331,47 @@ async def _save_completed_outputs(
     pipeline: Any,
     client: ComfyClient,
     history: dict[str, Any],
+    cancel_event: asyncio.Event | None = None,
 ) -> JobRecord:
     """Map, download, postprocess, and persist one completed Comfy prompt."""
     job = store.load_job(job_id)
     if job is None:
         raise ComfyError(f"job disappeared while completing: {job_id}")
+    resolved_manifest = validate_history(job.expected_artifacts, history)
     mapped = pipeline.map_history_outputs(history, job=job)
-    if not mapped:
-        raise ComfyError("Job finished but no expected outputs found")
+    validate_mapped_outputs(resolved_manifest, mapped)
 
     saved: dict[str, Path] = {}
     for key, ref in mapped.items():
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
         data = await client.download_image(
             ref.filename,
             subfolder=ref.subfolder,
             folder_type=ref.type,
         )
+        if not data:
+            raise ComfyError(f"Worker returned an empty download for output {key}: {ref.filename}")
+        if cancel_event is not None and cancel_event.is_set():
+            raise asyncio.CancelledError
         path = store.save_output_file(job_id, key, ref.filename, data)
         saved[key] = path
 
     job = store.load_job(job_id) or job
+    if cancel_event is not None and cancel_event.is_set():
+        raise asyncio.CancelledError
     try:
         pipeline.postprocess_job_outputs(job, saved)
-    except Exception:
-        logger.exception(
-            "postprocess_job_outputs failed for %s (%s)",
-            job_id,
-            job.pipeline_id,
-        )
+    except Exception as exc:
+        raise ComfyError(f"Output postprocessing failed: {exc}") from exc
+    if cancel_event is not None and cancel_event.is_set():
+        raise asyncio.CancelledError
+    missing = sorted(set(mapped) - set(saved))
+    if missing:
+        raise ComfyError(f"Postprocessing removed required output files: {missing}")
+    for key, path in saved.items():
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ComfyError(f"Postprocessing left an absent or empty output file: {key}")
 
     labels = (
         pipeline.labels_for_job(job)
@@ -366,6 +383,14 @@ async def _save_completed_outputs(
     job.outputs = store.build_output_slots(job_id, saved, labels=labels)
     job.input_previews = store.input_preview_urls(job_id)
     store.save_job(job)
+    # H3 validation evidence requires the complete output record to exist first.
+    # The adapter demotes this provisional success if either hook fails.
+    success_hook = getattr(pipeline, "on_job_succeeded", None)
+    if callable(success_hook):
+        try:
+            success_hook(job)
+        except Exception as exc:
+            raise ComfyError(f"Success hook failed: {exc}") from exc
     logger.info(
         "Job %s (%s) succeeded with %s outputs",
         job_id,
@@ -402,7 +427,21 @@ async def cancel_job(job_id: str) -> JobRecord | None:
     if job.status in (JobStatus.running, JobStatus.uploading, JobStatus.queued):
         previous_status = job.status
         if adapter.interrupt_on_cancel:
-            await adapter.cancel(_runtime_for(adapter))
+            try:
+                await adapter.cancel(job, _runtime_for(adapter))
+            except Exception as exc:
+                job = store.load_job(job_id) or job
+                job.status = JobStatus.failed
+                job.error = f"Prompt-specific cancellation failed: {exc}"
+                store.save_job(job)
+                from .shot_sync import on_pipeline_job_terminal
+
+                try:
+                    on_pipeline_job_terminal(job)
+                except Exception as sync_exc:
+                    job.error += f"; Terminal shot synchronization failed: {sync_exc}"
+                    store.save_job(job)
+                raise
         job.status = JobStatus.cancelled
         if adapter.id == "h3_api":
             if job.external_task_id:
@@ -418,22 +457,27 @@ async def cancel_job(job_id: str) -> JobRecord | None:
                 )
             else:
                 job.error = "MiniMax H3 API job cancelled locally before submission"
+        elif previous_status == JobStatus.running and not job.comfy_prompt_id:
+            job.error = (
+                "Cancelled locally while ComfyUI submission was in flight; the remote "
+                "outcome is uncertain. Inspect the pinned worker before resubmitting."
+            )
         else:
             job.error = "Cancelled by user"
         store.save_job(job)
         if adapter.id in LOCAL_COMFY_ADAPTER_IDS and job_id not in _tasks:
             await get_orchestrator().release_generation(job_id)
+            await _release_worker(job_id)
     if job.status == JobStatus.cancelled:
         try:
             from .shot_sync import on_pipeline_job_terminal
 
             on_pipeline_job_terminal(job)
-        except Exception:
-            logger.exception(
-                "shot_sync failed while cancelling job %s (%s)",
-                job.id,
-                job.pipeline_id,
-            )
+        except Exception as exc:
+            job.status = JobStatus.failed
+            job.error = f"Terminal shot synchronization failed after cancellation: {exc}"
+            store.save_job(job)
+            logger.error("shot_sync failed while cancelling job %s: %s", job.id, exc)
     labels = (
         pipeline.labels_for_job(job)
         if hasattr(pipeline, "labels_for_job")

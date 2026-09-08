@@ -5,9 +5,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ...core.schemas import JobRecord, JobStatus, LibraryAsset, OutputSlot
+from ..job_response import WorkerJobResponse
 
 
-class SceneJobResponse(BaseModel):
+class SceneJobResponse(WorkerJobResponse):
     id: str
     status: JobStatus
     name: str
@@ -51,6 +52,7 @@ class SceneJobResponse(BaseModel):
         if not isinstance(used, list):
             used = []
         return cls(
+            **cls.worker_fields(job),
             id=job.id,
             status=job.status,
             name=job.name,

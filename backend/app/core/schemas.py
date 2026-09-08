@@ -44,6 +44,13 @@ class JobRecord(BaseModel):
     error: str | None = None
     comfy_prompt_id: str | None = None
     external_task_id: str | None = None
+    # Immutable ownership after selection; all transport operations use this worker.
+    worker_id: str | None = None
+    worker_url: str | None = None
+    worker_selected_at: str | None = None
+    worker_selection: dict[str, Any] = Field(default_factory=dict)
+    memory_admission: dict[str, Any] | None = None
+    expected_artifacts: dict[str, Any] = Field(default_factory=dict)
     created_at: str
     updated_at: str
     outputs: dict[str, OutputSlot] = Field(default_factory=dict)

@@ -28,10 +28,10 @@ class FakeAdapter:
 
 
 def test_pipeline_declares_execution_adapter_without_type_inference():
-    assert ActorPipeline().execution_adapter_id == "comfy_mcp"
-    assert ScenePipeline().execution_adapter_id == "comfy_mcp"
-    assert PropPipeline().execution_adapter_id == "comfy_mcp"
-    assert RefFramePipeline().execution_adapter_id == "comfy_mcp"
+    assert ActorPipeline().execution_adapter_id == "comfy"
+    assert ScenePipeline().execution_adapter_id == "comfy"
+    assert PropPipeline().execution_adapter_id == "comfy"
+    assert RefFramePipeline().execution_adapter_id == "comfy"
     assert GptActorPipeline().execution_adapter_id == "external"
 
 
@@ -56,7 +56,7 @@ def test_registry_resolves_declared_adapter_and_allows_future_h3_api():
     comfy_mcp = FakeAdapter("comfy_mcp")
     registry = ExecutionAdapterRegistry([comfy, comfy_mcp, external, h3_api])
 
-    assert registry.resolve(ActorPipeline()) is comfy_mcp
+    assert registry.resolve(ActorPipeline()) is comfy
     assert registry.resolve(GptActorPipeline()) is external
 
     future_pipeline = type("FutureH3ApiPipeline", (), {"execution_adapter_id": "h3_api"})()
@@ -82,17 +82,17 @@ def test_h3_job_persists_provider_choice_for_adapter_routing():
             updated_at="2026-01-01T00:00:00Z",
         )
 
-    assert registry.resolve(pipeline, job=job("local")) is comfy_mcp
-    assert registry.resolve(pipeline, job=job("mcp")) is comfy_mcp
+    assert registry.resolve(pipeline, job=job("local")) is comfy
+    assert registry.resolve(pipeline, job=job("mcp")) is comfy
     assert registry.resolve(pipeline, job=job("minimax")) is h3_api
 
 
-def test_h3_pipeline_uses_mcp_adapter_when_global_provider_is_local(monkeypatch):
+def test_h3_pipeline_uses_http_adapter_when_global_provider_is_local(monkeypatch):
     from app.pipelines.h3_ref2va import pipeline as h3_pipeline_module
 
     monkeypatch.setattr(h3_pipeline_module.settings, "h3_provider", "local")
 
-    assert H3Ref2VaPipeline().execution_adapter_id == "comfy_mcp"
+    assert H3Ref2VaPipeline().execution_adapter_id == "comfy"
 
 
 def test_registry_rejects_duplicate_and_unknown_adapter_ids():
@@ -339,18 +339,9 @@ async def test_comfy_mcp_adapter_resumes_submitted_prompt_without_reupload(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_runner_closes_persistent_comfy_mcp_client(monkeypatch):
+async def test_runner_has_no_persistent_mcp_runtime():
     from app.core.jobs import runner
 
-    class ClosableClient:
-        closed = False
-
-        async def aclose(self):
-            self.closed = True
-
-    client = ClosableClient()
-    monkeypatch.setattr(runner, "_comfy_mcp_client", client)
-
+    assert "_comfy_mcp_client" not in vars(runner)
+    assert "comfy_mcp" not in runner._execution_adapters._adapters
     await runner.close_execution_runtimes()
-
-    assert client.closed is True

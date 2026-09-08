@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from ..config import settings
-from ..core.comfy import ComfyClient
+from ..core.comfy.workers import get_worker_registry
 from ..core.llm import get_llm_provider, public_llm_error
 from ..core.schemas import HealthResponse
 from .director import _public_error
@@ -21,8 +21,13 @@ async def health() -> HealthResponse:
     comfy_error = None
     details: dict = {}
     try:
-        details = await ComfyClient().health()
-        comfy_ok = True
+        workers = await get_worker_registry().status()
+        details = {"workers": workers}
+        comfy_ok = bool(workers) and all(w["status"] == "up" for w in workers)
+        if not workers:
+            comfy_error = "No render workers configured. Set DS_COMFY_WORKERS explicitly."
+        elif not comfy_ok:
+            comfy_error = "; ".join(f"{w['id']}: {w['error']}" for w in workers if w["status"] != "up")
     except Exception as exc:
         comfy_error = _public_error(exc, "Comfy health check")
 
@@ -51,7 +56,7 @@ async def health() -> HealthResponse:
         comfy_reachable=comfy_ok,
         comfy_error=comfy_error,
         details={
-            "comfy": details.get("system", {}) if details else {},
+            "workers": details.get("workers", []),
             "llm_provider": settings.llm_provider,
             "llm_reachable": llm_reachable,
             "llm_model": llm_model,

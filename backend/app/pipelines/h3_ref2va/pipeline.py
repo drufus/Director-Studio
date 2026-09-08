@@ -11,6 +11,7 @@ from typing import Any
 from PIL import Image, UnidentifiedImageError
 
 from ...config import settings
+from ...core.comfy.artifacts import declared_input_keys, video_manifest
 from ...core.h3.prompt import (
     validate_no_time_addressable_pictures,
     validate_required_picture_bindings,
@@ -39,8 +40,8 @@ class H3Ref2VaPipeline(Pipeline):
     @property
     def execution_adapter_id(self) -> str:
         return {
-            "local": "comfy_mcp",
-            "mcp": "comfy_mcp",
+            "local": "comfy",
+            "mcp": "comfy",
             "minimax": "h3_api",
         }[self._provider_name()]
 
@@ -50,9 +51,60 @@ class H3Ref2VaPipeline(Pipeline):
             if provider not in {"local", "mcp", "minimax"}:
                 raise ValueError(f"Unsupported H3 provider: {provider}")
             if provider in {"local", "mcp"}:
-                return "comfy_mcp"
+                return "comfy"
             return "h3_api"
         return self.execution_adapter_id
+
+    def expected_output_manifest(
+        self, job: JobRecord, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        selection = self._profile_for_job(job).mapping.output
+        return video_manifest(
+            prompt, node_id=selection.node_id, artifact_index=selection.artifact_index,
+            candidates=bool(job.params.get("h3_profile_test")),
+        )
+
+    @staticmethod
+    def _remote_input_keys(
+        params: dict[str, Any], inputs: dict[str, Any]
+    ) -> tuple[list[str], list[str], str | None]:
+        audio_keys = declared_input_keys("audio_keys", params.get("audio_keys", []), inputs)
+        native_key = params.get("native_audio_key")
+        if native_key is not None:
+            native_key = declared_input_keys("native_audio_key", [native_key], inputs)[0]
+        if "image_keys" in params:
+            image_keys = declared_input_keys("image_keys", params["image_keys"], inputs)
+        else:
+            # Legacy jobs without an explicit image order use only non-audio inputs.
+            image_keys = [key for key in inputs if key not in audio_keys and key != native_key]
+        if not image_keys:
+            raise ValueError("at least one reference image is required")
+        overlap = set(image_keys) & (set(audio_keys) | ({native_key} if native_key else set()))
+        if overlap:
+            raise ValueError("H3 input keys cannot be both image and audio: " + ", ".join(sorted(overlap)))
+        if params.get("audios") or params.get("audio_names"):
+            raise ValueError("Remote H3 audio must declare uploaded audio_keys, not worker-local audio filenames")
+        return image_keys, audio_keys, native_key
+
+    def prepare_upload_inputs(
+        self, job: JobRecord, inputs: dict[str, tuple[str, bytes]]
+    ) -> dict[str, tuple[str, bytes]]:
+        image_keys, audio_keys, native_key = self._remote_input_keys(job.params, inputs)
+        media_keys = {
+            "image": (image_keys, {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic", ".heif"}),
+            "audio": (audio_keys + ([native_key] if native_key else []), {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}),
+        }
+        for media, (keys, suffixes) in media_keys.items():
+            for key in keys:
+                value = inputs[key]
+                if not isinstance(value, tuple) or len(value) != 2:
+                    raise ValueError(f"H3 {media} input {key} has no filename/bytes pair")
+                filename, data = value
+                if not isinstance(filename, str) or Path(filename).suffix.lower() not in suffixes:
+                    raise ValueError(f"H3 {media} input {key} has an unsupported file type")
+                if not isinstance(data, bytes) or not data:
+                    raise ValueError(f"H3 {media} input {key} is empty or is not bytes")
+        return dict(inputs)
 
     def prepare_job_submission(self, job: JobRecord) -> None:
         """Snapshot local workflow state before the job can enter the queue."""
@@ -177,25 +229,8 @@ class H3Ref2VaPipeline(Pipeline):
             raise ValueError("frames is required")
         frames = int(frames)
 
-        image_keys = p.get("image_keys")
-        if isinstance(image_keys, list) and image_keys:
-            ordered_keys = [str(k) for k in image_keys]
-        else:
-            # Fall back to upload order as dict iteration (stable in Py3.7+)
-            ordered_keys = list(uploaded_images.keys())
-
-        image_names: list[str] = []
-        for key in ordered_keys:
-            name = uploaded_images.get(key)
-            if name:
-                image_names.append(name)
-
-        if not image_names and uploaded_images:
-            # If keys mismatched, use all uploads in stable order
-            image_names = list(uploaded_images.values())
-
-        if not image_names:
-            raise ValueError("at least one reference image is required")
+        image_keys, audio_keys, native_audio_key = self._remote_input_keys(p, uploaded_images)
+        image_names = [uploaded_images[key] for key in image_keys]
         validate_required_picture_bindings(
             prompt_text,
             (int(index) for index in layout_picture_indices),
@@ -206,21 +241,8 @@ class H3Ref2VaPipeline(Pipeline):
         if not isinstance(dialogue, list):
             dialogue = []
 
-        audio_keys = p.get("audio_keys") or []
-        if isinstance(audio_keys, list) and audio_keys:
-            audio_names = [
-                uploaded_images[str(key)]
-                for key in audio_keys
-                if str(key) in uploaded_images
-            ]
-        else:
-            audio_names = p.get("audios") or p.get("audio_names") or []
-            if not isinstance(audio_names, list):
-                audio_names = []
-        native_audio_name = None
-        native_audio_key = p.get("native_audio_key")
-        if native_audio_key:
-            native_audio_name = uploaded_images.get(str(native_audio_key))
+        audio_names = [uploaded_images[key] for key in audio_keys]
+        native_audio_name = uploaded_images[native_audio_key] if native_audio_key else None
 
         output_prefix = p.get("output_prefix")
         profile = self._profile_for_job(job)

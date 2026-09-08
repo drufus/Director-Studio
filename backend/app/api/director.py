@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..agents.director.context_io import load_agent_context
 from ..config import settings
-from ..core.comfy import ComfyClient
+from ..core.comfy.workers import get_worker_registry
 from ..core.llm import LLMProvider, LLMProviderError, get_llm_provider, public_llm_error
 from ..core.vram import get_director_model, get_orchestrator
 from ..core.vram.director_model import ModelSelectionError
@@ -229,14 +229,18 @@ async def vram_status() -> dict:
 
 
 @router.post("/director/free-comfy")
-async def free_comfy_models() -> dict:
+async def free_comfy_models(worker_id: str | None = None) -> dict:
     """Explicit user action to unload ComfyUI models, independent of auto policy."""
     orch = get_orchestrator()
     try:
         if orch.shared_gpu_enabled:
             stats = await orch.release_comfy_models(require_ok=True)
         else:
-            stats = await ComfyClient().free_memory(unload_models=True, free_memory=True)
+            if not worker_id:
+                raise HTTPException(422, "Select an explicit worker_id to release remote ComfyUI models")
+            stats = await get_worker_registry().client_for(worker_id).free_memory(unload_models=True, free_memory=True)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(503, _public_error(exc, "Comfy model release")) from None
     return {"ok": True, "stats": stats}

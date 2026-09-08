@@ -1,0 +1,173 @@
+"""One-process worker scheduling, durable pinning and explicit H3 admission."""
+from __future__ import annotations
+
+import asyncio
+import math
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from ...config import settings
+from .client import ComfyClient, ComfyError, validate_base_url
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class Worker:
+    id: str
+    base_url: str
+
+
+def parse_workers(value: str) -> list[Worker]:
+    workers: list[Worker] = []
+    for item in value.split(","):
+        if not item.strip():
+            if value.strip():
+                raise ComfyError("DS_COMFY_WORKERS contains an empty worker entry")
+            continue
+        worker_id, separator, url = item.strip().partition("=")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", worker_id):
+            raise ComfyError("DS_COMFY_WORKERS requires unique name=http(s)://host:port entries")
+        endpoint = validate_base_url(url.strip())
+        if any(w.id == worker_id or w.base_url == endpoint for w in workers):
+            raise ComfyError("DS_COMFY_WORKERS contains a duplicate worker ID or endpoint")
+        workers.append(Worker(worker_id, endpoint))
+    return workers
+
+
+class WorkerRegistry:
+    def __init__(self, workers: list[Worker], *, client_factory: Any = ComfyClient) -> None:
+        self.workers = {worker.id: worker for worker in workers}
+        self._states = {w.id: {"id": w.id, "base_url": w.base_url, "status": "unknown",
+            "checked_at": None, "error": None, "queued_jobs": None, "running_jobs": None} for w in workers}
+        self._client_factory = client_factory
+        self._lock = asyncio.Lock()
+        self._claims: dict[str, str] = {}
+        self._next = 0
+
+    def _down(self, worker_id: str, error: str) -> None:
+        self._states[worker_id].update(status="down", checked_at=_now(), error=error, queued_jobs=None, running_jobs=None)
+
+    def client_for(self, worker_id: str) -> ComfyClient:
+        worker = self.workers.get(worker_id)
+        if worker is None:
+            raise ComfyError(f"Render worker {worker_id!r} is not configured in DS_COMFY_WORKERS")
+        return self._client_factory(worker.base_url, worker_id=worker.id, on_failure=lambda error: self._down(worker.id, error))
+
+    async def _refresh(self, worker_id: str) -> None:
+        client = self.client_for(worker_id)
+        try:
+            await client.health()
+            queue = await client.get_queue()
+            self._states[worker_id].update(status="up", checked_at=_now(), error=None,
+                queued_jobs=len(queue["queue_pending"]), running_jobs=len(queue["queue_running"]))
+        except Exception as exc:
+            self._down(worker_id, str(exc))
+
+    async def status(self, *, refresh: bool = True) -> list[dict[str, Any]]:
+        if refresh:
+            await asyncio.gather(*(self._refresh(w) for w in self.workers))
+        return [dict(state) for state in self._states.values()]
+
+    async def bind_job(self, job: Any, allow_selection: bool = True) -> ComfyClient:
+        from ..jobs.store import save_job
+        async with self._lock:
+            if job.worker_id or job.worker_url:
+                worker = self.workers.get(job.worker_id)
+                if not worker or worker.base_url != job.worker_url:
+                    raise ComfyError(f"Job {job.id} is pinned to worker {job.worker_id!r} at {job.worker_url!r}; that exact worker configuration is unavailable. Job will not be rerouted")
+            elif not allow_selection:
+                raise ComfyError(f"Job {job.id} has no durable worker pin; cannot resume a submitted job")
+            else:
+                states = await self.status()
+                if not states:
+                    raise ComfyError("No render workers configured. Set DS_COMFY_WORKERS explicitly")
+                requested = job.params.get("worker_id")
+                candidates = [s for s in states if s["status"] == "up" and (requested is None or s["id"] == requested)]
+                if not candidates:
+                    reasons = "; ".join(f"{s['id']}: {s['error'] or s['status']}" for s in states)
+                    raise ComfyError(f"No eligible render worker{f' matching {requested!r}' if requested else ''}. {reasons}")
+                # Rotating tie-break + remote queue load + this process's in-flight claims.
+                order = list(self.workers)
+                rank = {key: (i - self._next) % len(order) for i, key in enumerate(order)}
+                selected = min(candidates, key=lambda s: (s["queued_jobs"] + s["running_jobs"] + sum(v == s["id"] for v in self._claims.values()), rank[s["id"]]))
+                self._next = (order.index(selected["id"]) + 1) % len(order)
+                worker = self.workers[selected["id"]]
+                job.worker_id = worker.id
+                job.worker_url = worker.base_url
+                job.worker_selected_at = _now()
+                job.worker_selection = {"strategy": "requested" if requested else "least_queued", "workers": states}
+                # This write is the boundary: no HTTP upload is allowed before it succeeds.
+                save_job(job)
+            self._claims[job.id] = worker.id
+            return self.client_for(worker.id)
+
+    async def release_job(self, job_id: str) -> None:
+        async with self._lock:
+            self._claims.pop(job_id, None)
+
+    async def check_h3_admission(self, job: Any, client: ComfyClient) -> None:
+        from ..jobs.store import save_job
+        ram_threshold = settings.comfy_min_free_ram_gib
+        vram_threshold = settings.comfy_min_free_vram_gib
+        snapshot: dict[str, Any] = {"worker_id": job.worker_id, "worker_url": job.worker_url,
+            "checked_at": _now(), "ram_free_bytes": None, "ram_total_bytes": None, "devices": [],
+            "min_free_ram_bytes": int(ram_threshold * 1024**3) if ram_threshold is not None else None,
+            "min_free_vram_bytes": int(vram_threshold * 1024**3) if vram_threshold is not None else None,
+            "accepted": False, "error": None}
+        job.memory_admission = snapshot
+        problems: list[str] = []
+
+        def measured(value: Any, label: str) -> int | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                problems.append(f"/system_stats is missing a valid {label}")
+                return None
+            return int(value)
+
+        try:
+            stats = await client.health()
+            system = stats.get("system") or {}
+            snapshot["ram_free_bytes"] = measured(system.get("ram_free"), "system.ram_free")
+            snapshot["ram_total_bytes"] = measured(system.get("ram_total"), "system.ram_total")
+            devices = stats.get("devices")
+            if not isinstance(devices, list) or not devices:
+                problems.append("/system_stats has no GPU devices")
+            else:
+                for device in devices:
+                    snapshot["devices"].append({"index": device.get("index"), "name": device.get("name"),
+                        "vram_free_bytes": measured(device.get("vram_free"), "device.vram_free"),
+                        "vram_total_bytes": measured(device.get("vram_total"), "device.vram_total")})
+            for field, config_key in (("min_free_ram_bytes", "DS_COMFY_MIN_FREE_RAM_GIB"), ("min_free_vram_bytes", "DS_COMFY_MIN_FREE_VRAM_GIB")):
+                if snapshot[field] is None:
+                    problems.append(f"{config_key} must be explicitly configured for H3")
+            free_ram = snapshot["ram_free_bytes"]
+            min_ram = snapshot["min_free_ram_bytes"]
+            if free_ram is not None and min_ram is not None and free_ram < min_ram:
+                problems.append(f"system RAM free={free_ram / 1024**3:.2f} GiB ({free_ram} bytes), required={min_ram / 1024**3:.2f} GiB ({min_ram} bytes)")
+            for device in snapshot["devices"]:
+                free_vram, min_vram = device["vram_free_bytes"], snapshot["min_free_vram_bytes"]
+                if free_vram is not None and min_vram is not None and free_vram < min_vram:
+                    problems.append(f"GPU {device['index']} VRAM free={free_vram / 1024**3:.2f} GiB ({free_vram} bytes), required={min_vram / 1024**3:.2f} GiB ({min_vram} bytes)")
+        except Exception as exc:
+            problems.append(f"Cannot measure H3 headroom: {exc}")
+        snapshot["accepted"] = not problems
+        snapshot["error"] = "; ".join(problems) or None
+        save_job(job)
+        if problems:
+            raise ComfyError(f"H3 admission failed on worker {job.worker_id} ({job.worker_url}): {snapshot['error']}")
+
+
+_registry: WorkerRegistry | None = None
+_registry_config: str | None = None
+
+
+def get_worker_registry() -> WorkerRegistry:
+    global _registry, _registry_config
+    if _registry is None or _registry_config != settings.comfy_workers:
+        _registry = WorkerRegistry(parse_workers(settings.comfy_workers))
+        _registry_config = settings.comfy_workers
+    return _registry

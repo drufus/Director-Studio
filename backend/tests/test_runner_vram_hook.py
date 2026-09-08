@@ -122,7 +122,7 @@ async def test_start_pipeline_job_reserves_before_background_task(monkeypatch, t
 
 
 @pytest.mark.asyncio
-async def test_start_comfy_mcp_job_reserves_before_background_task(monkeypatch, tmp_path):
+async def test_start_actor_comfy_job_reserves_before_background_task(monkeypatch, tmp_path):
     jobs_root = tmp_path / "jobs"
     jobs_root.mkdir()
     monkeypatch.setattr(settings, "jobs_dir", jobs_root)
@@ -131,7 +131,7 @@ async def test_start_comfy_mcp_job_reserves_before_background_task(monkeypatch, 
 
     class FakePipeline:
         id = "actor"
-        execution_adapter_id = "comfy_mcp"
+        execution_adapter_id = "comfy"
         generation_kind = "image"
         output_labels = {"actor": "Actor"}
 
@@ -143,7 +143,7 @@ async def test_start_comfy_mcp_job_reserves_before_background_task(monkeypatch, 
     job = store.create_job(
         pipeline_id="actor",
         asset_kind="actors",
-        name="reserve-mcp-before-run",
+        name="reserve-http-before-run",
         params={},
     )
 
@@ -157,7 +157,7 @@ async def test_start_comfy_mcp_job_reserves_before_background_task(monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_run_comfy_mcp_job_releases_generation_reservation(monkeypatch, tmp_path):
+async def test_run_actor_comfy_job_releases_generation_reservation(monkeypatch, tmp_path):
     jobs_root = tmp_path / "jobs"
     jobs_root.mkdir()
     monkeypatch.setattr(settings, "jobs_dir", jobs_root)
@@ -166,10 +166,10 @@ async def test_run_comfy_mcp_job_releases_generation_reservation(monkeypatch, tm
 
     class FakePipeline:
         id = "actor"
-        execution_adapter_id = "comfy_mcp"
+        execution_adapter_id = "comfy"
 
     class FakeAdapter:
-        id = "comfy_mcp"
+        id = "comfy"
 
         async def run(self, job, pipeline, images, cancel, runtime):
             orch.calls.append(("adapter_run", job.id))
@@ -177,7 +177,7 @@ async def test_run_comfy_mcp_job_releases_generation_reservation(monkeypatch, tm
     job = store.create_job(
         pipeline_id="actor",
         asset_kind="actors",
-        name="release-mcp-after-run",
+        name="release-http-after-run",
         params={},
     )
     monkeypatch.setattr(runner, "get_pipeline", lambda _pid: FakePipeline())
@@ -217,6 +217,17 @@ async def test_run_job_calls_before_then_after_on_success(monkeypatch, tmp_path)
         execution_adapter_id = "comfy"
         output_labels = {"layout": "Layout"}
 
+        def prepare_upload_inputs(self, job, inputs):
+            return inputs
+
+        def expected_output_manifest(self, job, prompt):
+            from app.core.comfy.artifacts import image_manifest
+
+            return image_manifest(prompt, {"1": ["layout"]})
+
+        def postprocess_job_outputs(self, job, saved):
+            pass
+
         def build_prompt(self, job, *, uploaded_images):
             return {"1": {}}, 42
 
@@ -228,12 +239,16 @@ async def test_run_job_calls_before_then_after_on_success(monkeypatch, tmp_path)
     fake_client = SimpleNamespace(
         upload_image=AsyncMock(return_value="up.png"),
         queue_prompt=AsyncMock(return_value="prompt-1"),
-        wait_for_completion=AsyncMock(return_value={"outputs": {}}),
+        wait_for_completion=AsyncMock(return_value={
+            "status": {"completed": True, "status_str": "success", "messages": []},
+            "outputs": {"1": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]}},
+        }),
         download_image=AsyncMock(return_value=b"png-bytes"),
     )
 
     monkeypatch.setattr(runner, "get_pipeline", lambda _pid: FakePipeline())
-    monkeypatch.setattr(runner, "ComfyClient", lambda: fake_client)
+    monkeypatch.setattr(runner, "_bind_worker", AsyncMock(return_value=fake_client))
+    monkeypatch.setattr(runner, "_release_worker", AsyncMock())
 
     cancel = asyncio.Event()
     await runner._run_job(job.id, {}, cancel)
@@ -274,6 +289,17 @@ async def test_run_job_after_comfy_on_failure(monkeypatch, tmp_path):
         execution_adapter_id = "comfy"
         output_labels = {}
 
+        def prepare_upload_inputs(self, job, inputs):
+            return inputs
+
+        def expected_output_manifest(self, job, prompt):
+            from app.core.comfy.artifacts import image_manifest
+
+            return image_manifest(prompt, {"1": ["layout"]})
+
+        def postprocess_job_outputs(self, job, saved):
+            pass
+
         def build_prompt(self, job, *, uploaded_images):
             raise RuntimeError("graph boom")
 
@@ -281,7 +307,8 @@ async def test_run_job_after_comfy_on_failure(monkeypatch, tmp_path):
             return {}
 
     monkeypatch.setattr(runner, "get_pipeline", lambda _pid: BoomPipeline())
-    monkeypatch.setattr(runner, "ComfyClient", lambda: SimpleNamespace())
+    monkeypatch.setattr(runner, "_bind_worker", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(runner, "_release_worker", AsyncMock())
 
     cancel = asyncio.Event()
     await runner._run_job(job.id, {}, cancel)

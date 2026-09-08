@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...core.comfy.artifacts import image_manifest
 from ...core.schemas import ComfyImageRef, JobRecord, LibraryAsset
 from ..base import Pipeline
 from . import workflow
@@ -17,6 +18,11 @@ class RefFramePipeline(Pipeline):
         "review_status=pending_review."
     )
     enabled = True
+
+    def expected_output_manifest(
+        self, job: JobRecord, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        return image_manifest(prompt, {workflow.NODE_SAVE: ["layout"]})
 
     def __init__(self) -> None:
         # Only enable when the checked-in workflow shell validates
@@ -80,8 +86,10 @@ class RefFramePipeline(Pipeline):
             raise ValueError("description is required")
 
         image_keys = p.get("image_keys")
-        if isinstance(image_keys, list) and image_keys:
-            ordered_keys = [str(k) for k in image_keys]
+        if image_keys is not None:
+            from ...core.comfy.artifacts import declared_input_keys
+
+            ordered_keys = declared_input_keys("image_keys", image_keys, uploaded_images)
         else:
             # Prefer ref_0, ref_1, … then any remaining uploads in stable order
             ref_keys = sorted(
@@ -101,9 +109,6 @@ class RefFramePipeline(Pipeline):
             name = uploaded_images.get(key)
             if name:
                 image_names.append(name)
-
-        if not image_names and uploaded_images:
-            image_names = list(uploaded_images.values())
 
         output_prefix = p.get("output_prefix")
         ref_labels = p.get("ref_labels")

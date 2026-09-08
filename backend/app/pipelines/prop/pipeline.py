@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...core.comfy.artifacts import image_manifest
 from ...core.schemas import ComfyImageRef, JobRecord
 from ..base import Pipeline
 from . import workflow
@@ -15,6 +16,11 @@ class PropPipeline(Pipeline):
         "Prep one uploaded prop photo into a multi-view H3 reference sheet: "
         "the same object shown consistently from useful angles."
     )
+
+    def expected_output_manifest(
+        self, job: JobRecord, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        return image_manifest(prompt, {workflow.NODE_SAVE: ["master"]})
 
     @property
     def output_labels(self) -> dict[str, str]:
