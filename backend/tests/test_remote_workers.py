@@ -326,3 +326,17 @@ async def test_node_errors_exclude_received_values_and_keep_accepted_id_on_cance
     assert "Provider authentication failed" in str(error.value)
     assert "worker lost during cancellation" in str(error.value)
     assert "test-private-workflow-key" not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_partial_submission_keeps_accepted_id_when_cleanup_is_interrupted():
+    from app.core.comfy.client import ComfySubmissionError
+    def handler(request):
+        if request.url.path == "/prompt":
+            return httpx.Response(200, json={"prompt_id": "partial-interrupted", "node_errors": {"7": {"errors": [{"message": "Missing model"}]}}})
+        raise asyncio.CancelledError
+    client = ComfyClient("http://worker.test", transport=httpx.MockTransport(handler))
+    with pytest.raises(ComfySubmissionError, match="cleanup.*interrupted") as error:
+        await client.queue_prompt({})
+    assert error.value.prompt_id == "partial-interrupted"
+    assert "Missing model" in str(error.value)

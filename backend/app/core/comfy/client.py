@@ -217,6 +217,8 @@ class ComfyClient:
             if isinstance(prompt_id, str) and prompt_id:
                 try:
                     await self.cancel_prompt(prompt_id)
+                except asyncio.CancelledError:
+                    message += f"; cleanup of accepted prompt {prompt_id} was interrupted; it may still be running"
                 except ComfyError as exc:
                     message += f"; cancellation of accepted prompt {prompt_id} failed: {exc}; it may still be running"
                 raise ComfySubmissionError(str(self._error(message)), prompt_id)
