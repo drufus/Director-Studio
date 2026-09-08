@@ -17,12 +17,13 @@ backend/app/
   main.py                 # create_app(), mount routers
   config.py               # DS_* settings (Comfy, LLM provider, GPU policy, paths)
   api/                    # cross-cutting HTTP
-    health.py             # /api/health (Comfy + configured LLM/model readiness)
+    health.py             # /api/health (worker fleet + configured LLM/model readiness)
+    comfy_workers.py      # /api/comfy/workers (per-worker health and queue counts)
     files.py
     pipelines.py
     projects.py           # Project/Shot + Director gates + H3 submit
   core/
-    comfy/                # ComfyUI HTTP client
+    comfy/                # HTTP transport, worker registry, artifact contracts
     jobs/                 # generic job store + background runner (+ VRAM hook)
     library/              # multi-kind asset library
     projects/             # Project + Shot models, disk store, state transitions
@@ -53,7 +54,9 @@ Implement `pipelines.base.Pipeline`:
 | Method | Role |
 |--------|------|
 | `id` / `asset_kind` / `display_name` | Identity + library folder |
+| `prepare_upload_inputs(job, inputs)` | Validate declared references and add required generated inputs |
 | `build_prompt(job, uploaded_images)` | Patch workflow JSON → Comfy prompt |
+| `expected_output_manifest(job, prompt)` | Declare designated nodes and required artifacts before submission |
 | `map_history_outputs(history)` | SaveImage / SaveVideo nodes → logical keys |
 | `output_labels` | UI labels for slots |
 | `save_to_library(...)` | Default copies outputs into `data/library/<kind>/` |
@@ -67,6 +70,14 @@ register_pipeline(MyPipeline())
 ```
 
 Wire HTTP in `api/__init__.py` via `include_router`.
+
+## Remote execution
+
+One Director process schedules across an N-worker registry. Each job atomically saves its worker ID, URL, selection time, and candidate health snapshot before upload. Files move by HTTP to and from that worker; no shared Comfy installation or disk is needed. Restart recovery, history polling, downloads, and prompt-specific cancellation use the persisted pin. A changed or removed endpoint fails visibly.
+
+The job declares an artifact manifest before POST `/prompt`. Only designated complete output sets can succeed. A running job without a prompt ID is ambiguous and never resubmitted automatically; only queued/uploading jobs without an accepted ID may replay. H3 records and checks fresh system/GPU memory before submission. Errors in downloads, postprocessing, and success hooks become job failures. See [worker configuration and remaining acceptance work](REMOTE-WORKERS.md).
+
+The MCP integration modules remain historical source, but are unregistered and unreferenced by the active runner/API path. Native dependencies contain neither comfy-mcp nor comfy-cli.
 
 ## Data on disk
 

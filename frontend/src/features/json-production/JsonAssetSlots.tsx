@@ -1,3 +1,4 @@
+import { RenderJobInfo } from "../../shared/components/RenderJobInfo";
 import type { JsonPictureRole, JsonProductionShot, JsonShotJobRecord, ShotFileMaps } from "./types";
 
 const ACTIVE = new Set(["queued", "uploading", "running"]);
@@ -169,6 +170,7 @@ export function JsonAssetSlots({
             {job.status}
             <span className="job-id">{job.id}</span>
           </div>
+          <RenderJobInfo job={job} />
           {job.error ? <div className="banner error">{job.error}</div> : null}
         </div>
       ) : (

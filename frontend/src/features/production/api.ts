@@ -1,5 +1,6 @@
 import { parseError } from "../../shared/api/client";
 import type {
+  SharedRenderJobMetadata,
   JobStatus,
   OutputSlot,
   Project,
@@ -123,7 +124,7 @@ export async function skipLayout(shotId: string): Promise<Shot> {
   return res.json();
 }
 
-export interface H3JobRecord {
+export interface H3JobRecord extends SharedRenderJobMetadata {
   id: string;
   status: JobStatus;
   name: string;

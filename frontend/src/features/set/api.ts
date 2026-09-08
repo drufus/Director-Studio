@@ -1,9 +1,9 @@
 import { parseError } from "../../shared/api/client";
-import type { JobStatus, OutputSlot } from "../../shared/api/types";
+import type { SharedRenderJobMetadata, JobStatus, OutputSlot } from "../../shared/api/types";
 
 export type { JobStatus, OutputSlot };
 
-export interface SceneJobRecord {
+export interface SceneJobRecord extends SharedRenderJobMetadata {
   id: string;
   status: JobStatus;
   name: string;

@@ -115,7 +115,7 @@ describe("ProductionPage prompt refresh", () => {
     vi.mocked(getProject).mockResolvedValue(detail(shot(emptyPrompt)));
     render(<ProductionPage active />);
     expect(await screen.findByText("Workflow: My H3 Quality Profile")).toBeTruthy();
-    expect(screen.getByText("Local · ComfyUI — My H3 Quality Profile")).toBeTruthy();
+    expect(screen.getByText("Render workers · ComfyUI — My H3 Quality Profile")).toBeTruthy();
   });
 
   it("refreshes a damaged profile before local submission and again after completion while retaining the captured profile", async () => {
@@ -319,6 +319,22 @@ describe("ProductionPage prompt refresh", () => {
     expect(screen.getByRole("heading", { name: "H3 prompt" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Submit H3" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Save prompt" })).toBeNull();
+  });
+
+  it("shows a failed render's worker and specific memory error in mobile Production", async () => {
+    vi.mocked(getProject).mockResolvedValue(detail({ ...shot(generatedPrompt), status: "failed", h3_job_id: "job-low-memory" }));
+    vi.mocked(getH3Job).mockResolvedValue({
+      id: "job-low-memory", status: "failed", name: "H3", notes: "", prompt: "",
+      dialogue: [], frames: 56, error: "render-a has 4.0 GiB free VRAM; required 12.0 GiB",
+      comfy_prompt_id: null, external_task_id: null,
+      created_at: "2026-09-08T01:00:00Z", updated_at: "2026-09-08T01:00:00Z",
+      outputs: {}, input_previews: {}, pipeline_id: "h3_ref2va", worker_id: "render-a", worker_url: "http://render-a:8188",
+    });
+    render(<ProductionPage active mobile />);
+    expect(await screen.findByText("render-a has 4.0 GiB free VRAM; required 12.0 GiB")).toBeTruthy();
+    expect(screen.getByText("render-a")).toBeTruthy();
+    expect(screen.getByText("http://render-a:8188")).toBeTruthy();
+    expect(screen.queryByText(/Open desktop Production for diagnostic details/)).toBeNull();
   });
 
   it("opens the selected Shot's material editor from mobile Production references", async () => {
