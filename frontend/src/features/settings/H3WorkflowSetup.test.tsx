@@ -346,7 +346,7 @@ it.each(["queued", "uploading"])("keeps polling an unbound %s test until the pin
   pendingTestId = "job-1";
   rememberImport();
   let jobPolls = 0;
-  const memoryError = "worker-a: free RAM 10.9 GiB (required 64.0 GiB), free VRAM 4.8 GiB (required 64.0 GiB)";
+  const memoryError = "worker-a: free VRAM 4.8 GiB (required 12.0 GiB)";
   const fetchOriginal = vi.mocked(fetch).getMockImplementation()!;
   vi.mocked(fetch).mockImplementation((input, init) => {
     if (String(input).includes("/jobs/job-1")) {

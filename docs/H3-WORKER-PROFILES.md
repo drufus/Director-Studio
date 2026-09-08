@@ -67,18 +67,28 @@ The selected `minimax_h3_ref2va_SPARK.json` graph was exported through ComfyUI's
 
 The four deployed weight files total **39.5538 GiB**: checkpoint **19.5302 GiB**, text encoder **14.6098 GiB**, video VAE **4.8501 GiB**, and audio VAE **0.5637 GiB**. File sizes are a planning input, not a measurement of loaded model memory.
 
-For the initial **56-frame, 864×480** validation, use these conservative admission settings:
+The original unmeasured admission estimate is withdrawn. The operator reports that rebooting node #8 cleared orphaned unified-pool residue; steady state after boot and model load is about 53 GiB free system RAM and 32.6 GiB free VRAM, with zero swap. Those are operator-reported readings, not calibration results.
+
+For the authorized **56-frame, 864×480** calibration only, use:
 
 ```dotenv
-DS_COMFY_MIN_FREE_RAM_GIB=64
-DS_COMFY_MIN_FREE_VRAM_GIB=64
+DS_COMFY_MIN_FREE_VRAM_GIB=1
+DS_COMFY_MEMORY_THRESHOLD_PROVISIONAL=true
+DS_COMFY_MEMORY_SAMPLE_INTERVAL_SEC=1
+DS_COMFY_MEMORY_REQUEST_TIMEOUT_SEC=30
 ```
 
-This estimate leaves approximately **24.45 GiB** above serialized weight sizes for loading and computation. It is **not a measured peak or a guarantee**. Dequantization, activations, reference count, dimensions, frame count, and other graph stages can change the requirement. Reassess headroom for production-length jobs using measured execution evidence.
+The 1 GiB threshold is deliberately low to permit the measurement the operator requested. It is **provisional and not a production recommendation**. The operator will set the production threshold from the measured peak plus margin; no production threshold is inferred from serialized weight sizes. Dimensions, frame count, reference count, and graph stages can change the requirement.
 
-The GB10 uses unified memory: the RAM and VRAM figures describe overlapping capacity, so the two 64 GiB checks do **not** require 128 GiB combined. Both measurements must independently satisfy their threshold. The recent node #8 readings of approximately **10.9 GiB free RAM** and **4.8 GiB free VRAM** are below these settings. That headroom blocks admission; it does not justify evicting unrelated services, unloading their models, reducing thresholds silently, or rerouting to an unapproved node.
+The GB10 uses unified memory. `/system_stats` RAM and VRAM describe overlapping capacity but diverge substantially. Admission evaluates **`vram_free` only** for every render device. RAM remains informational; the values are neither added nor averaged. The app does not evict other services, unload their models, or reroute to an unapproved node.
 
-Before POST `/prompt`, the pinned job saves the fresh `/system_stats` snapshot, measured free/total RAM and VRAM, required thresholds, timestamp, worker identity, decision, and failure reason in `memory_admission`. Low or missing measurements produce a specific failed job with the available and required values. A failed admission is not a successful render test and cannot activate the workflow.
+Before POST `/prompt`, the pinned job saves the fresh `/system_stats` snapshot, measured free/total RAM and VRAM, required VRAM threshold, provisional flag, timestamp, worker identity, decision, and failure reason in `memory_admission`. Low or missing VRAM measurements produce a specific failed job with the available and required values. A failed admission is not a successful render test and cannot activate the workflow.
+
+`memory_usage` records submission, interval, and completion samples in the job record. For each device, it reports baseline free VRAM, minimum sampled free VRAM, sampled peak used VRAM (`vram_total - minimum vram_free`), increase from baseline, peak timestamp, and total VRAM. Samples retain their timestamps and RAM context. Any telemetry errors remain visible; incomplete sampling must not be described as a complete measurement.
+
+For periodic execution samples, the interval is a minimum delay **after the preceding statistics request completes**, not a fixed sampling frequency. Request latency lengthens the spacing; submission and completion samples may be closer together. Sample timestamps record actual observations. Statistics requests use the separately configurable 30-second timeout above; a timeout remains an explicit telemetry error and fails the test even if ComfyUI finishes the render.
+
+The reported peak covers the **whole worker pool**, including other workloads; it is not the allocation attributable to this job alone. Periodic sampling can miss peaks shorter than the configured interval. Retain both peak used VRAM and the baseline-to-minimum free VRAM change when reporting the calibration, so the operator can set a margin with those limits in mind.
 
 ## Acceptance record
 
@@ -89,10 +99,35 @@ The Settings flow ran locally on macOS against remote beastviii on **2026-09-08 
 | Settings import ID and workflow digest | `imp-5a82d8ed9e4ddd937c3036ef6350110b`; SHA-256 `09fd6877d333efa09c0d79aa7a9eed1cd1a17499b1db44abfcd4fb2ac6e385de` |
 | Read-only validation through Settings | Passed against live beastviii metadata; selected H3 75, seed 20, final SaveVideo 46 |
 | 56-frame test job ID and admission outcome | `job_2d0e39bb2409` failed admission before POST `/prompt`; prompt ID remains null |
-| Remote test render and activation | Pending sufficient admitted headroom and successful artifacts |
-| Production H3 render | Pending successful workflow activation and production admission |
-| Backend/frontend tests and CI | 1,196 backend tests and 233 frontend tests pass locally; frontend build passes. Native CI repeats the checks on macOS, Linux x64, and Linux ARM64 in the Phase 4 PR. The existing 16 legacy Windows cases remain deselected; no new quarantine. |
+| Remote 56-frame test | `job_cd3e1511d6f6` succeeded on beastviii; selected output downloaded to the app's data directory; 225 memory samples, zero telemetry errors |
+| Workflow activation | **Use Workflow** succeeded through Settings; explicit active profile `custom-09fd6877d333efa09c0d79aa7a9eed1c-5864722557769b5c`, no warning, eligible only on beastviii at its configured URL |
+| Production H3 render | Pending the operator's production threshold and a production render |
+| Backend/frontend tests and CI | 1,234 backend tests and 236 frontend tests pass locally; frontend build passes. Native CI repeats the checks on macOS, Linux x64, and Linux ARM64 in the Phase 4 PR. The existing 16 legacy Windows cases remain deselected; no new quarantine. |
 
-The job measured **11,664,068,608 bytes (10.86 GiB) free RAM** and **5,152,732,104 bytes (4.80 GiB) free VRAM**, each below **68,719,476,736 bytes (64 GiB)**. The saved `memory_admission` record includes both measurements, totals, required thresholds, worker ID/URL, and timestamp. Sanitized local evidence is `.tmp/phase4/live-test-evidence.json`; `.tmp/phase4/settings-memory-evidence.png` captures the failure and disabled activation after a browser reload. A reference image reached the worker by HTTP before admission; no generation graph was submitted. Capacity must become available before the same validated import can obtain execution proof and activate.
+That pre-reboot job measured **11,664,068,608 bytes (10.86 GiB) free RAM** and **5,152,732,104 bytes (4.80 GiB) free VRAM**. It failed against the now-withdrawn placeholder threshold. Sanitized historical evidence remains at `.tmp/phase4/live-test-evidence.json`; `.tmp/phase4/settings-memory-evidence.png` captures the failure and disabled activation after a browser reload. A reference image reached the worker by HTTP before admission; no generation graph was submitted. These readings do not describe the rebooted worker and do not establish an execution peak.
 
-Only `beastviii` at `http://100.93.117.98:8188` is configured. The [accepted topology](CLUSTER-PORT-PLAN.md) remains in force. Live acceptance on each of two workers is **deferred, not dropped**, until the operator enables a second suitable worker. Systemd installation on node #6, private runtime env installation, Tailscale browser access, and durable service logs remain a separate Phase 5 deployment.
+### Post-reboot calibration results
+
+Both executions used the authorized 56-frame SPARK test on the same pinned worker and the provisional 1 GiB admission setting. The cold run loaded the H3 stack; the subsequent warm run reused resident state. These different starting conditions matter when choosing a production threshold.
+
+| Measurement | Cold run `job_126264783711` | Warm run `job_cd3e1511d6f6` |
+| --- | --- | --- |
+| Job result | Failed: render completed, but one statistics `ReadTimeout` made calibration incomplete | Succeeded with downloaded video |
+| Observation window, 2026-09-08 UTC | 15:05:10–15:09:24 | 15:15:56–15:19:59 |
+| Successful samples / telemetry errors | 228 / 1 | 225 / 0 |
+| VRAM free at submission | 32.6316 GiB | 4.4467 GiB |
+| Minimum sampled free VRAM | 1.0977 GiB | 1.7009 GiB |
+| Sampled peak used VRAM, whole worker pool | **120.5918 GiB** | **119.9887 GiB** |
+| Increase in pool usage from submission | 31.5339 GiB | 2.7458 GiB |
+| Peak observation, UTC | 15:08:59.829041 | 15:19:43.409428 |
+| Total reported VRAM | 121.6896 GiB | 121.6896 GiB |
+
+The cold run's largest observed pool usage was **129,484,477,780 bytes**, with **1,178,688,172 bytes** free at that observation and a **33,859,224,916-byte** increase from its **35,037,913,088-byte** free baseline. Its timeout means that the true peak may be higher; this run did not certify the workflow or masquerade as a successful test.
+
+The successful warm run's sampled peak was **128,836,891,060 bytes**, with **1,826,274,892 bytes** free and a **2,948,330,876-byte** increase from its **4,774,605,768-byte** free baseline. Its mean observation spacing was approximately **1.083 seconds**, with a longest recorded spacing of **4.649 seconds**. Zero telemetry errors establishes complete recorded sampling for this run, not continuous observation of every instant.
+
+The video loaded in Settings at **864×480**, duration **2.333333 seconds** (56 frames at 24 fps), with browser readiness state 4 and no playback error. The **Use Workflow** action activated the successful evidence, and the API returned the explicit custom profile without a warning. The inspected browser evidence is `.tmp/phase4/reboot/activated-test.png`.
+
+The warm run's 2.7458 GiB change must not be treated as the cold loading requirement. Neither peak isolates this job from other processes sharing the pool. The operator's production threshold remains **pending**; the 1 GiB calibration setting stays explicitly provisional. Durable local records are `.tmp/phase4/data/jobs/job_126264783711/job.json` and `.tmp/phase4/data/jobs/job_cd3e1511d6f6/job.json`.
+
+Only `beastviii` at `http://100.93.117.98:8188` is configured. No second worker is planned, and node #3's former H3 install on port 8189 was deliberately retired. The registry continues to support N workers. The [accepted topology](CLUSTER-PORT-PLAN.md) supersedes the earlier two-worker live acceptance requirement. Systemd installation on node #6, private runtime env installation, Tailscale browser access, and durable service logs remain a separate Phase 5 deployment.

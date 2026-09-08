@@ -17,6 +17,7 @@ export interface SharedRenderJobMetadata {
   worker_selected_at?: string | null;
   worker_selection?: Record<string, unknown>;
   memory_admission?: RenderMemoryAdmission | null;
+  memory_usage?: RenderMemoryUsage | null;
   expected_artifacts?: Record<string, unknown>;
 }
 
@@ -27,10 +28,44 @@ export interface RenderMemoryAdmission {
   ram_free_bytes: number | null;
   ram_total_bytes: number | null;
   devices: { index: number; name: string; vram_free_bytes: number | null; vram_total_bytes: number | null }[];
-  min_free_ram_bytes: number | null;
+  /** Historical records may retain this field; current admission uses VRAM only. */
+  min_free_ram_bytes?: number | null;
   min_free_vram_bytes: number | null;
+  metric?: "vram_free";
+  threshold_provisional?: boolean;
   accepted: boolean;
   error: string | null;
+}
+
+export interface RenderMemorySample {
+  sampled_at: string;
+  phase: string;
+  ram_free_bytes: number | null;
+  ram_total_bytes: number | null;
+  devices: { index: number; name: string; vram_free_bytes: number | null; vram_total_bytes: number | null }[];
+}
+
+export interface RenderMemoryUsage {
+  status: "recording" | "completed" | "incomplete" | "interrupted";
+  worker_id: string;
+  worker_url: string;
+  sample_interval_sec: number;
+  started_at: string;
+  finished_at: string | null;
+  sample_count: number;
+  devices: {
+    index: number;
+    name: string;
+    vram_total_bytes: number | null;
+    baseline_vram_free_bytes: number | null;
+    min_vram_free_bytes: number | null;
+    peak_vram_used_bytes: number | null;
+    peak_vram_delta_bytes: number | null;
+    peak_at: string | null;
+  }[];
+  samples: RenderMemorySample[];
+  errors: { sampled_at: string; phase: string; error: string }[];
+  note: string;
 }
 
 export interface H3WorkerBinding {

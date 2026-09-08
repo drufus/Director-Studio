@@ -205,8 +205,8 @@ class ComfyClient:
             raise self._error(f"{route} returned a non-object response", unavailable=True)
         return value
 
-    async def health(self) -> dict[str, Any]:
-        return self._object(await self._request("GET", "/system_stats", timeout=5), "/system_stats")
+    async def health(self, *, timeout: float = 5) -> dict[str, Any]:
+        return self._object(await self._request("GET", "/system_stats", timeout=timeout), "/system_stats")
 
     async def get_queue(self) -> dict[str, Any]:
         result = self._object(await self._request("GET", "/queue", timeout=5), "/queue")

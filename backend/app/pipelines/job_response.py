@@ -13,6 +13,7 @@ class WorkerJobResponse(BaseModel):
     worker_selected_at: str | None = None
     worker_selection: dict[str, Any] = Field(default_factory=dict)
     memory_admission: dict[str, Any] | None = None
+    memory_usage: dict[str, Any] | None = None
     expected_artifacts: dict[str, Any] = Field(default_factory=dict)
 
     @staticmethod

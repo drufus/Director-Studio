@@ -7,6 +7,7 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -253,7 +254,7 @@ class _CompletedTestClient:
 def _runtime(client) -> ComfyExecutionRuntime:
     from app.core.jobs.runner import _save_completed_outputs
 
-    async def no_op(*args):
+    async def no_op(*args, **kwargs):
         return None
 
     async def bind_worker(job, *, allow_selection):
@@ -266,6 +267,11 @@ def _runtime(client) -> ComfyExecutionRuntime:
         bind_worker=bind_worker, release_worker=no_op, admit_h3=no_op,
         prepare=no_op, finish=no_op, update_phase=no_op,
         save_completed_outputs=_save_completed_outputs,
+        # These fixtures resume synthetic completed prompts to isolate profile
+        # artifact/activation guards; sampler lifecycle is covered separately.
+        memory_sampler=lambda *args: SimpleNamespace(
+            start=no_op, finish=no_op, require_complete=lambda: None,
+        ),
     )
 
 

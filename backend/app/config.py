@@ -18,8 +18,10 @@ class Settings(BaseSettings):
     comfy_base_url: str = "http://127.0.0.1:8188"
     comfy_workers: str = ""
     # Operators set workflow-specific minimum headroom before any H3 submission.
-    comfy_min_free_ram_gib: float | None = Field(default=None, gt=0)
     comfy_min_free_vram_gib: float | None = Field(default=None, gt=0)
+    comfy_memory_threshold_provisional: bool = False
+    comfy_memory_sample_interval_sec: float = Field(default=1.0, gt=0, le=60)
+    comfy_memory_request_timeout_sec: float = Field(default=30.0, gt=0, le=120)
     host: str = "127.0.0.1"
     port: int = 8790
     reload: bool = False

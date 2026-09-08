@@ -65,6 +65,11 @@ class Client:
             ]}},
         }
 
+    async def health(self, **kwargs):
+        return {"system": {"ram_free": 1}, "devices": [
+            {"index": 0, "name": "GPU", "vram_free": 32 * 1024**3, "vram_total": 128 * 1024**3}
+        ]}
+
     async def upload_image(self, data, filename):
         durable = store.load_job(self.job_id)
         assert durable.worker_id == "selected-worker"
@@ -185,11 +190,11 @@ async def test_failed_memory_admission_never_posts(job_root):
     job = new_job(pipeline_id="h3_ref2va")
     client = Client(job.id)
     runtime, _, _ = make_runtime(client)
-    runtime = replace(runtime, admit_h3=AsyncMock(side_effect=ValueError("RAM free 2 GiB < required 16 GiB")))
+    runtime = replace(runtime, admit_h3=AsyncMock(side_effect=ValueError("VRAM free 2 GiB < required 16 GiB")))
     await ComfyExecutionAdapter().run(job, Pipeline(), {}, asyncio.Event(), runtime)
     final = store.load_job(job.id)
     assert final.status == JobStatus.failed
-    assert "RAM free 2 GiB < required 16 GiB" in final.error
+    assert "VRAM free 2 GiB < required 16 GiB" in final.error
     assert client.submissions == []
     assert final.worker_id == "selected-worker"
 
@@ -434,7 +439,7 @@ async def test_registry_runs_two_jobs_on_distinct_workers_with_pinned_file_movem
             self.base_url = base_url
             self.worker_id = worker_id
 
-        async def health(self):
+        async def health(self, **kwargs):
             return {"system": {}}
 
         async def get_queue(self):
@@ -514,3 +519,217 @@ async def test_partial_submission_error_preserves_remote_prompt_identity(job_roo
     assert "cancellation also failed" in final.error
     assert client.waits == []
     assert client.downloads == []
+
+
+@pytest.mark.asyncio
+async def test_h3_sampler_tracks_prompt_to_terminal_after_telemetry_failure(job_root):
+    from dataclasses import replace
+    from app.core.comfy.memory import H3MemorySampler
+
+    job = new_job(pipeline_id="h3_ref2va")
+    client = Client(job.id)
+    original_health = client.health
+    failed = asyncio.Event()
+    health_calls = 0
+
+    async def health(**kwargs):
+        nonlocal health_calls
+        health_calls += 1
+        if health_calls == 2:
+            failed.set()
+            raise RuntimeError("/system_stats returned HTTP 503")
+        return await original_health()
+
+    async def wait(prompt_id, *, cancel_event):
+        client.waits.append(prompt_id)
+        await asyncio.wait_for(failed.wait(), timeout=1)
+        ongoing = store.load_job(job.id)
+        assert ongoing.status == JobStatus.running
+        assert "HTTP 503" in ongoing.memory_usage["errors"][0]["error"]
+        return client.history
+
+    client.health, client.wait_for_completion = health, wait
+    runtime, _, _ = make_runtime(client)
+    runtime = replace(runtime, memory_sampler=lambda *args: H3MemorySampler(*args, interval=0.001))
+    pipeline = Pipeline()
+    pipeline.on_job_succeeded = lambda job: pytest.fail("Incomplete peak cannot certify H3 validation")
+    await ComfyExecutionAdapter().run(job, pipeline, {}, asyncio.Event(), runtime)
+    final = store.load_job(job.id)
+    assert final.status == JobStatus.failed
+    assert "render completed" in final.error
+    assert "HTTP 503" in final.error
+    assert final.comfy_prompt_id == "prompt-on-selected-worker"
+    assert client.waits == ["prompt-on-selected-worker"]
+    assert len(client.submissions) == 1
+    assert client.downloads == ["front.png", "back.png"]
+    assert set(final.outputs) == {"front", "back"}
+    from pathlib import Path
+
+    assert all(Path(output.path).read_bytes() == b"artifact bytes" for output in final.outputs.values())
+    assert final.memory_usage["samples"][-1]["phase"] == "completed"
+    assert final.memory_usage["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["failed", "cancelled", "interrupted"])
+async def test_h3_terminal_sample_preserves_peak_and_submission(job_root, outcome):
+    job = new_job(pipeline_id="h3_ref2va")
+    client = Client(job.id)
+    cancel_event = asyncio.Event()
+    waiting = asyncio.Event()
+    calls = 0
+
+    async def health(**kwargs):
+        nonlocal calls
+        calls += 1
+        return {"devices": [{"index": 0, "name": "GB10", "vram_total": 128 * 1024**3,
+                             "vram_free": (32 if calls == 1 else 7) * 1024**3}]}
+
+    async def wait(prompt_id, *, cancel_event):
+        waiting.set()
+        if outcome == "interrupted":
+            await asyncio.Future()
+        if outcome == "cancelled":
+            cancel_event.set()
+            raise asyncio.CancelledError
+        raise RuntimeError("Comfy execution failed at node 75")
+
+    client.health, client.wait_for_completion = health, wait
+    runtime, _, _ = make_runtime(client)
+    task = asyncio.create_task(ComfyExecutionAdapter().run(job, Pipeline(), {}, cancel_event, runtime))
+    if outcome == "interrupted":
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        await task
+    final = store.load_job(job.id)
+    assert final.status == (JobStatus.running if outcome == "interrupted" else JobStatus(outcome))
+    assert final.comfy_prompt_id == "prompt-on-selected-worker"
+    assert len(client.submissions) == 1
+    assert final.memory_usage["samples"][-1]["phase"] == outcome
+    assert final.memory_usage["devices"][0]["min_vram_free_bytes"] == 7 * 1024**3
+    assert final.memory_usage["devices"][0]["peak_vram_delta_bytes"] == 25 * 1024**3
+
+
+@pytest.mark.asyncio
+async def test_h3_resume_never_requeues_and_retains_prior_memory_peak(job_root):
+    from app.core.comfy.memory import H3MemorySampler
+
+    job = new_job(pipeline_id="h3_ref2va")
+    client = Client(job.id)
+    runtime, binds, events = make_runtime(client)
+    await runtime.bind_worker(job, allow_selection=True)
+    job.status, job.comfy_prompt_id = JobStatus.running, "original-prompt"
+    job.expected_artifacts = Pipeline().expected_output_manifest(job, {"1": {}})
+    store.save_job(job)
+    sampler = H3MemorySampler(job, client, interval=60)
+    await sampler.start()
+    await sampler.finish("interrupted")
+    prior = store.load_job(job.id).memory_usage
+    binds.clear()
+    events.clear()
+    await ComfyExecutionAdapter().resume(store.load_job(job.id), Pipeline(), asyncio.Event(), runtime)
+    final = store.load_job(job.id)
+    assert client.submissions == []
+    assert client.uploads == []
+    assert client.waits == ["original-prompt"]
+    assert binds == [(job.id, False)]
+    assert events == ["bind", "prepare"]
+    assert final.memory_usage["devices"] == prior["devices"]
+    assert final.memory_usage["sample_count"] == prior["sample_count"] + 2
+    assert final.status == JobStatus.failed
+    assert "unobserved interval" in final.error
+
+
+@pytest.mark.asyncio
+async def test_remote_cancellation_retains_samples_written_during_request(job_root, monkeypatch):
+    from types import SimpleNamespace
+
+    job = new_job(pipeline_id="h3_ref2va")
+    job.status, job.comfy_prompt_id = JobStatus.running, "remote-prompt"
+    store.save_job(job)
+
+    async def cancel(job, runtime):
+        updated = store.load_job(job.id)
+        updated.memory_usage = {"sample_count": 7, "devices": [{"min_vram_free_bytes": 12}]}
+        store.save_job(updated)
+
+    adapter = SimpleNamespace(id="comfy", interrupt_on_cancel=True, cancel=cancel)
+    monkeypatch.setattr(runner._execution_adapters, "resolve", lambda *args, **kwargs: adapter)
+    monkeypatch.setattr(runner, "get_pipeline", lambda _id: Pipeline())
+    monkeypatch.setattr(runner, "get_orchestrator", lambda: SimpleNamespace(release_generation=AsyncMock()))
+    monkeypatch.setattr(runner, "_release_worker", AsyncMock())
+    cancelled = await runner.cancel_job(job.id)
+    assert cancelled.status == JobStatus.cancelled
+    assert cancelled.memory_usage["sample_count"] == 7
+    assert store.load_job(job.id).memory_usage["devices"][0]["min_vram_free_bytes"] == 12
+
+
+@pytest.mark.asyncio
+async def test_completion_check_sees_durable_outputs_before_any_success_state_or_hook(job_root):
+    job = new_job()
+    job.status = JobStatus.running
+    job.expected_artifacts = Pipeline().expected_output_manifest(job, {"1": {}})
+    store.save_job(job)
+    client = Client(job.id)
+    pipeline = Pipeline()
+    pipeline.on_job_succeeded = lambda job: pytest.fail("Unaccepted completion must not invoke success hooks")
+    checks = []
+
+    def reject_completion():
+        durable = store.load_job(job.id)
+        checks.append(durable.status)
+        assert set(durable.outputs) == {"front", "back"}
+        raise RuntimeError("measurement incomplete")
+
+    with pytest.raises(RuntimeError, match="measurement incomplete"):
+        await runner._save_completed_outputs(job.id, pipeline=pipeline, client=client,
+                                             history=client.history, completion_check=reject_completion)
+    assert checks == [JobStatus.running]
+    assert store.load_job(job.id).status == JobStatus.running
+    assert client.downloads == ["front.png", "back.png"]
+
+
+@pytest.mark.asyncio
+async def test_h3_download_recovery_reuses_completed_memory_without_resubmitting(job_root):
+    job = new_job(pipeline_id="h3_ref2va")
+    client = Client(job.id)
+    downloading = asyncio.Event()
+
+    async def interrupted_download(filename, **kwargs):
+        downloading.set()
+        await asyncio.Future()
+
+    client.download_image = interrupted_download
+    runtime, _, _ = make_runtime(client)
+    task = asyncio.create_task(ComfyExecutionAdapter().run(job, Pipeline(), {}, asyncio.Event(), runtime))
+    await asyncio.wait_for(downloading.wait(), timeout=1)
+    observed = store.load_job(job.id).memory_usage
+    assert observed["status"] == "completed"
+    assert observed["samples"][-1]["phase"] == "completed"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    interrupted = store.load_job(job.id)
+    assert interrupted.status == JobStatus.running
+    assert interrupted.comfy_prompt_id == "prompt-on-selected-worker"
+    assert interrupted.memory_usage == observed
+
+    recovered_client = Client(job.id)
+    recovered_client.health = AsyncMock(side_effect=AssertionError("Completed measurements must remain closed"))
+    recovered_runtime, binds, events = make_runtime(recovered_client)
+    await ComfyExecutionAdapter().resume(interrupted, Pipeline(), asyncio.Event(), recovered_runtime)
+    final = store.load_job(job.id)
+    assert final.status == JobStatus.succeeded
+    assert set(final.outputs) == {"front", "back"}
+    assert recovered_client.downloads == ["front.png", "back.png"]
+    assert len(client.submissions) == 1
+    assert recovered_client.submissions == []
+    assert recovered_client.uploads == []
+    assert recovered_client.waits == ["prompt-on-selected-worker"]
+    recovered_client.health.assert_not_awaited()
+    assert binds == [(job.id, False)]
+    assert events == ["bind", "prepare"]
+    assert final.memory_usage == observed
