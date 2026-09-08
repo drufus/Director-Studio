@@ -7,6 +7,12 @@ from ..core.vram.ollama_client import OllamaClient
 router = APIRouter(tags=["system"])
 
 
+@router.get("/health/live")
+async def liveness() -> dict[str, bool]:
+    """Check this service without contacting external inference providers."""
+    return {"ok": True}
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     comfy_ok = False

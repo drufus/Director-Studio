@@ -17,6 +17,23 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source layout and exten
 | Execution | ComfyUI through MCP (actor / scene / prop / Layout / local H3) · MiniMax H3 official API |
 | Planning LLM | Local Ollama (exclusive VRAM with Comfy) |
 
+## Native macOS and Linux setup
+
+The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The ongoing cluster port is staged: this setup is Phase 1; LiteLLM inference, independent GPU coordination, remote worker routing, and systemd deployment follow in separate changes. The existing inference code still uses Ollama and Comfy MCP at this stage.
+
+Install Python 3.11+ (3.12 recommended), Node.js 22.12+ with npm, and FFmpeg/ffprobe on `PATH`. On macOS, Homebrew can provide `python@3.12`, `node@22`, and `ffmpeg`; follow its instructions to put the selected executables on `PATH`. On Ubuntu/DGX OS, install `python3-venv`, `python3-pip`, and `ffmpeg`, plus a supported Node.js version.
+
+```bash
+./scripts/setup.sh --dev
+./start.sh
+```
+
+Open http://127.0.0.1:8790. Ctrl-C stops the service. Setup creates a private Python environment, installs application/test dependencies, builds the UI, and creates `backend/.env` only when absent. It preserves existing configuration, data, and logs. It does not install inference servers or model files.
+
+For backend reload, use `DS_RELOAD=true ./start.sh`. For frontend editing, run `npm run dev` from `frontend/` in another terminal and open http://127.0.0.1:5173; its API proxy expects the backend on port 8790. Deployment startup defaults to one worker with reload disabled.
+
+See [native setup and checks](docs/NATIVE-SETUP.md) for interpreter selection, persistent paths, and the Windows-only test quarantine. PowerShell and PyInstaller files below are retained as legacy artifacts and are excluded from the native CI workflow.
+
 ## Windows portable installation
 
 The portable package runs Director Studio locally as one `DirectorStudio.exe`. The UI and backend are included; Ollama and ComfyUI remain external local services. The included installer creates a private Python environment for `comfy-cli` and `comfy-mcp`.
@@ -305,7 +322,9 @@ pwsh -File scripts/build-legacy-portable.ps1
 
 Before distributing the result, extract the new zip, configure its `.env`, start ComfyUI and Ollama, and run one real job for every workflow you replaced. For an imported H3 profile, use the Settings Test step before activation, then submit a new Production job. Unit tests verify the graph contract and mapping; only a real ComfyUI run proves that all custom nodes, model files, tensor shapes, and output formats are compatible on the target installation.
 
-## Development setup
+## Legacy Windows development setup
+
+For macOS and Linux, use the native setup above. The following commands describe the retained legacy path.
 
 ```powershell
 # Backend (from backend/)
@@ -378,7 +397,10 @@ API: `/api/actors/*` · `GET /api/pipelines`
 | `DS_COMFY_MCP_COMMAND` | `comfy-mcp` | ComfyUI MCP executable; Portable installer writes its absolute path |
 | `DS_COMFY_MCP_ARGS` | empty | Optional extra command-line arguments passed to the MCP server process |
 | `DS_COMFY_MCP_COMFY_BIN` | `comfy` | comfy-cli executable used by the MCP server |
+| `DS_HOST` | `127.0.0.1` | Listener address |
 | `DS_PORT` | `8790` | API port |
+| `DS_RELOAD` | `false` | Explicit backend reload for source development |
+| `DS_DATA_DIR` | repository `data/` | Persistent application storage root |
 | `DS_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Local Ollama for Director |
 | `DS_H3_MINIMAX_API_KEY` | empty | MiniMax API credential when `DS_H3_PROVIDER=minimax` |
 | `DS_H3_MINIMAX_MODEL` | `MiniMax-H3` | MiniMax H3 API model |
