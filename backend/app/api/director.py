@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..agents.director.context_io import load_agent_context
 from ..config import settings
+from ..core.comfy.client import ComfyError
 from ..core.comfy.workers import get_worker_registry
 from ..core.llm import LLMProvider, LLMProviderError, get_llm_provider, public_llm_error
 from ..core.vram import get_director_model, get_orchestrator
@@ -52,7 +53,7 @@ def _public_error(error: Exception, operation: str) -> str:
     """Only dedicated public exceptions may supply unredacted error messages."""
     if isinstance(error, (LLMProviderError, ModelSelectionError)):
         return public_llm_error(error)
-    if isinstance(error, GPUBusyError):
+    if isinstance(error, (GPUBusyError, ComfyError)):
         return str(error)
     if isinstance(error, httpx.HTTPStatusError):
         return f"{operation} failed (HTTP {error.response.status_code})."

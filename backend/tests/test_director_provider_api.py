@@ -259,3 +259,26 @@ async def test_manual_free_failure_is_not_success(monkeypatch):
         await director_api.free_comfy_models(worker_id="test")
     assert error.value.status_code == 503
     assert error.value.detail == "Comfy model release failed to connect."
+
+
+@pytest.mark.asyncio
+async def test_health_keeps_specific_worker_configuration_failure(provider, health_dependencies):
+    from app.core.comfy.client import ComfyError
+    health_dependencies.status.side_effect = ComfyError("DS_COMFY_WORKERS contains a duplicate worker ID or endpoint")
+    body = await health_api.health()
+    assert body.ok is False
+    assert body.comfy_error == "DS_COMFY_WORKERS contains a duplicate worker ID or endpoint"
+    assert body.details["llm_reachable"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_free_keeps_specific_worker_failure(monkeypatch):
+    from app.core.comfy.client import ComfyError
+    orch = SimpleNamespace(shared_gpu_enabled=False)
+    comfy = SimpleNamespace(free_memory=AsyncMock(side_effect=ComfyError("worker test: POST /free returned HTTP 503")))
+    monkeypatch.setattr(director_api, "get_orchestrator", lambda: orch)
+    monkeypatch.setattr(director_api, "get_worker_registry", lambda: SimpleNamespace(client_for=lambda worker_id: comfy))
+    with pytest.raises(HTTPException) as error:
+        await director_api.free_comfy_models(worker_id="test")
+    assert error.value.status_code == 503
+    assert error.value.detail == "worker test: POST /free returned HTTP 503"

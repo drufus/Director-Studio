@@ -58,7 +58,7 @@ Phase 4 still must bind profile inspection/validation/test/activation evidence t
 
 Backend tests cover N-worker concurrent execution, durable pins before upload, immutable resume endpoints, worker failure without reroute, H3 memory rejection, partial accepted graphs, incomplete downloads, failed hooks, uncertain restart states, targeted cancellation, metadata failures, and redacted error diagnostics. Frontend tests cover worker outages, multiple active jobs, explicit setup selection, memory numbers, and mobile failures. The existing 16 Windows-only packaging cases remain excluded; no new quarantine was added.
 
-Local Phase 3 verification: 1,101 backend tests and 210 frontend tests pass; frontend production build passes. Native CI repeats backend/frontend/build/startup checks on macOS, Linux x64, and Linux ARM64.
+Local Phase 3 verification: 1,103 backend tests and 210 frontend tests pass; frontend production build passes. Native CI repeats backend/frontend/build/startup checks on macOS, Linux x64, and Linux ARM64.
 
 The read-only probe on 2026-09-08 at 04:19 UTC through the new registry reported node #8 up, with no running/pending queue entries, H3 Ref2AV class present, 11,689,590,784 bytes free system RAM (10.89 GiB), and 5,147,022,280 bytes free VRAM (4.79 GiB). These are point-in-time measurements, not guaranteed admission headroom. Sanitized evidence remains at `.tmp/phase3-readonly-worker-probe.json`.
 
