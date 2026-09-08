@@ -1,4 +1,4 @@
-# Remote ComfyUI workers — Phase 3
+# Remote ComfyUI workers
 
 Director Studio runs one API process and schedules Comfy jobs across an N-worker registry. It needs no local ComfyUI installation, comfy-mcp, comfy-cli, or shared disk. macOS development and the Linux service use the same transport and data model.
 
@@ -48,11 +48,13 @@ Independent GPU policy keeps Director chat available during multiple queued/uplo
 
 Worker errors retain safe node identity and failure messages while excluding execution input/output dumps, tracebacks, and validation received-values. Configured runtime credentials and recognized credential fields are redacted. Do not put credentials inside imported workflow JSON; use the private runtime environment for service credentials.
 
-## H3 phase boundary
+## H3 workflow evidence
 
-The setup UI now explicitly selects a worker for metadata inspection, dependency validation, and the 56-frame test job. Unreachable metadata fails visibly. Dependency validation uses read-only `/object_info` to check installed classes, required inputs, and enum selections; it does not submit a render or claim that custom node execution validators have run. `/prompt` performs execution validation at submission.
+The setup UI explicitly binds each import to a worker ID and URL for metadata inspection, dependency validation, the 56-frame test, and activation. Changing or clearing the worker invalidates its evidence; changed relevant metadata or graph boundaries require revalidation and testing. Each custom profile records separate eligible-worker proofs, and scheduling uses only matching configured endpoints. An explicitly selected missing, changed, or invalid profile blocks submission and names the requested identity. Selecting the built-in is an explicit recovery action; it is never substituted automatically.
 
-Phase 4 still must bind profile inspection/validation/test/activation evidence to the same worker, reject broken explicit profile selections instead of the existing bundled fallback, and validate the real H3 graph end to end. The current pipeline `workflow.py` contracts and shipped workflow JSON are unchanged. This Phase 3 PR is not production H3 acceptance.
+Dependency validation uses read-only `/object_info`, including Comfy V3 flattened Autogrow and nested DynamicCombo inputs. It does not queue a render or execute custom node validators. `/prompt` performs execution validation, and successful artifact retrieval supplies test evidence. The `workflow.py` contracts and shipped workflow JSON remain unchanged.
+
+See [H3 worker profiles](H3-WORKER-PROFILES.md) for the lifecycle, SPARK export, exact live acceptance record, and the initial 64 GiB RAM/VRAM planning thresholds. Current node #8 headroom is below those thresholds. This estimate is not a measured peak; low memory remains a specific admission failure rather than permission to evict unrelated services.
 
 ## Verification and remaining acceptance
 
@@ -62,4 +64,4 @@ Local Phase 3 verification: 1,103 backend tests and 210 frontend tests pass; fro
 
 The read-only probe on 2026-09-08 at 04:19 UTC through the new registry reported node #8 up, with no running/pending queue entries, H3 Ref2AV class present, 11,689,590,784 bytes free system RAM (10.89 GiB), and 5,147,022,280 bytes free VRAM (4.79 GiB). These are point-in-time measurements, not guaranteed admission headroom. Sanitized evidence remains at `.tmp/phase3-readonly-worker-probe.json`.
 
-Live work in this phase is read-only against authorized node #8. No actor or H3 render has been submitted, and no service has been deployed. A real actor asset on each of two workers remains deferred until the operator enables a second suitable worker. Phase 4 owns the real H3 import/test/production checks; Phase 5 owns node #6 systemd deployment, Tailscale browser acceptance, private env installation, and durable logs. Polling remains the v1 progress mechanism; websocket progress, stronger cancellation race handling, and whole-set artifact promotion remain deferred.
+Phase 3 live work was read-only against authorized node #8. The [Phase 4 acceptance record](H3-WORKER-PROFILES.md#acceptance-record) tracks the subsequent Settings import, test admission, and remaining render checks. No service has been deployed. A real actor asset on each of two workers remains deferred until the operator enables a second suitable worker. Real H3 test and production renders remain incomplete until memory admission and artifact checks succeed; Phase 5 owns node #6 systemd deployment, Tailscale browser acceptance, private env installation, and durable logs. Polling remains the v1 progress mechanism; websocket progress, stronger cancellation race handling, and whole-set artifact promotion remain deferred.

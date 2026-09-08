@@ -33,6 +33,11 @@ export interface RenderMemoryAdmission {
   error: string | null;
 }
 
+export interface H3WorkerBinding {
+  worker_id: string;
+  worker_url: string;
+}
+
 export interface H3ActiveProfile {
   profile_id: string;
   display_name: string;
@@ -41,10 +46,15 @@ export interface H3ActiveProfile {
   contract_version: number;
   validated_at?: string | null;
   warning: { code: string; message: string; details?: Record<string, unknown> } | null;
+  eligible_workers?: H3WorkerBinding[];
+  selection_source?: "initial_default" | "explicit";
+  selection_message?: string | null;
 }
 
 export interface H3Profiles {
-  active: H3ActiveProfile;
+  active: H3ActiveProfile | null;
+  active_error?: { code: string; message: string; details?: Record<string, unknown> } | null;
+  selected_profile_id?: string | null;
   profiles: { profile_id: string; display_name: string; source: "builtin" | "custom"; workflow_sha256: string; status: "active" | "available" | "tested" }[];
 }
 

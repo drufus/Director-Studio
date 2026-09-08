@@ -22,6 +22,7 @@ backend/app/
     files.py
     pipelines.py
     projects.py           # Project/Shot + Director gates + H3 submit
+    h3_workflow_profiles.py # worker-bound H3 inspection / validation / test / activation
   core/
     comfy/                # HTTP transport, worker registry, artifact contracts
     jobs/                 # generic job store + background runner (+ VRAM hook)
@@ -31,6 +32,7 @@ backend/app/
     llm/                  # provider/client contract, OpenAI-compatible and Ollama adapters
     vram/                 # independent/exclusive policy + scoped model persistence
     schemas.py            # JobRecord, LibraryAsset, JobStatus, HealthResponse, …
+  workflow_profiles/h3/  # immutable graphs, boundary mappings, worker proofs, active selection
   agents/
     director/             # plan script, queue first frames, write six-section prompt
       service.py          # DirectorService orchestration
@@ -79,6 +81,16 @@ The job declares an artifact manifest before POST `/prompt`. Only designated com
 
 The MCP integration modules remain historical source, but are unregistered and unreferenced by the active runner/API path. Native dependencies contain neither comfy-mcp nor comfy-cli.
 
+## H3 workflow profiles
+
+The deterministic runtime importer in `workflow_profiles/h3` keeps the existing selected-terminal and upstream Ref2AV boundary contract, including optional seed mapping, VHS terminals, and unrelated graph branches. It does not change the pipeline `workflow.py` adapters or shipped JSON. The imported graph owns its model, sampler, and postprocessing choices.
+
+An import explicitly binds to a configured worker ID and URL. Inspection saves a digest of graph-relevant `/object_info` schemas; validation and the completed test must match that digest, graph, mapping, output identity, and binding generation. Worker changes, changed metadata, and changed boundaries invalidate dependent evidence. The read-only validator supports V3 Autogrow, COMBO, and nested DynamicCombo shapes; executing custom validators and proving output production require an actual admitted test.
+
+Installed custom profiles retain a proof for each eligible worker. Jobs capture immutable graph, mapping, and proof snapshots before worker selection; the N-worker registry filters custom H3 jobs by the captured ID/URL pairs and preserves the selected pin thereafter. A fresh store can use the shipped initial default, but a broken explicit profile selection fails and names that identity. Both Production interfaces stop submission on a failed workflow refresh. Settings keeps import repair and explicit built-in recovery available.
+
+See [H3 worker profiles and live acceptance](H3-WORKER-PROFILES.md). Successful long renders remain gated on measured headroom; systemd deployment is Phase 5.
+
 ## Data on disk
 
 ```
@@ -92,6 +104,10 @@ data/
     scenes/…
     layouts/…         # first_frame pipeline (layout_first_frame role)
     productions/…     # h3_ref2va video outputs
+  workflow_profiles/h3/
+    active.json       # explicit selection; missing initial pointer is distinct from invalid
+    imports/          # API JSON, worker binding, inspection, mapping, validation, test
+    profiles/         # installed workflow identities and per-worker proofs
   projects/
     <prj_id>/
       project.json
@@ -148,7 +164,7 @@ Job runner calls `before_comfy_job` for **all** Comfy pipelines under exclusive 
 | `actor` | Casting workbench | Auto-route by uploads |
 | `scene` | Multi-angle set design | `QwenEdit2511_MultiAngle_SceneRef` |
 | `first_frame` | Layout still for a shot | Library asset; **not** I2V socket |
-| `h3_ref2va` | Production video | Pure `MiniMaxH3ReferenceToVideo`; max 9 refs; 15 steps / `res_multistep` / `beta` |
+| `h3_ref2va` | Production video | Pure `MiniMaxH3ReferenceToVideo`; max 9 refs; sampling stays owned by the selected graph (SPARK: 20 steps) |
 
 H3 prompt six-section order: `subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`. Frame lengths: `n % 17 == 5`, range 124–362.
 
@@ -213,6 +229,8 @@ Graph order: **master → full-body three-view → bust three-view** (bust from 
 | Costume / Props | New `pipelines/*` | not built |
 | Director Agent | `agents/director` + projects API + Director UI | **implemented** |
 | H3 Ref2AV + first frame | `pipelines/h3_ref2va`, `pipelines/first_frame` | **implemented** |
+| H3 worker-bound profile evidence | `workflow_profiles/h3` + Settings + worker registry | **implemented**; live render acceptance awaits sufficient headroom |
+| Cluster service deployment | node #6 systemd + Tailscale + durable logs | Phase 5 |
 | Independent/exclusive GPU policy | `core/vram` + job runner hook + chat API/UI | **implemented** |
 | Project / Shot dual gates | `core/projects` + Production UI | **implemented** |
 | Production review | `features/production` | **implemented** |
