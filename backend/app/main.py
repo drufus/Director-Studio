@@ -5,11 +5,12 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import build_api_router
 from .config import settings
+from .core.comfy.client import ComfyError
 from .core.jobs import close_execution_runtimes, recover_interrupted_jobs
 from .runtime_paths import runtime_paths
 
@@ -45,6 +46,10 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    @app.exception_handler(ComfyError)
+    async def comfy_failure(_request, exc: ComfyError) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"detail": str(exc)})
+
     app.include_router(build_api_router())
 
     frontend_dist = settings.frontend_dist

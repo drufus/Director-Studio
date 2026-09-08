@@ -6,16 +6,16 @@ import json
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 
-from ..core.comfy.client import ComfyClient
+from ..core.comfy.client import ComfyError
+from ..core.comfy.workers import get_worker_registry
 from ..core.jobs import create_job, start_pipeline_job
 from ..core.library.images import resolve_asset_image
 from ..core.library.store import asset_dir, load_asset
 from ..core.paths import LIBRARY_KINDS
-from ..integrations.comfy_mcp import ComfyMcpClient, ComfyMcpError
 from ..pipelines.h3_ref2va.workflow import fill_profile_graph
 from ..workflow_profiles.h3 import (
     H3BoundaryMapping,
@@ -44,6 +44,7 @@ class SelectOutputRequest(_StrictModel):
 
 
 class TestProfileRequest(_StrictModel):
+    worker_id: StrictStr = Field(min_length=1)
     picture_asset_id: StrictStr = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     audio_asset_id: StrictStr | None = Field(
         default=None,
@@ -249,11 +250,11 @@ async def import_h3_workflow(
     }
 
 
-async def _object_info_or_none() -> dict[str, Any] | None:
+async def _worker_object_info(worker_id: str) -> dict[str, Any]:
     try:
-        return await ComfyClient().get_object_info()
-    except Exception:  # noqa: BLE001 - topology-only fallback is deliberate
-        return None
+        return await get_worker_registry().client_for(worker_id).get_object_info()
+    except ComfyError as exc:
+        raise HTTPException(503, str(exc)) from None
 
 
 def _analysis_payload(
@@ -273,13 +274,13 @@ def _analysis_payload(
 
 
 @router.get("/imports/{import_id:path}/analysis", response_model=None)
-async def analyze_h3_import(import_id: str) -> dict[str, Any] | JSONResponse:
+async def analyze_h3_import(import_id: str, worker_id: str) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
         graph = store.load_import_workflow(import_id)
         analysis = inspect_h3_workflow(
             graph,
-            object_info=await _object_info_or_none(),
+            object_info=await _worker_object_info(worker_id),
             output_node_id=store.load_import_output(import_id),
         )
         return _analysis_payload(store, import_id, analysis)
@@ -293,11 +294,12 @@ async def analyze_h3_import(import_id: str) -> dict[str, Any] | JSONResponse:
 async def select_h3_import_output(
     import_id: str,
     body: SelectOutputRequest,
+    worker_id: str,
 ) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
         graph = store.load_import_workflow(import_id)
-        object_info = await _object_info_or_none()
+        object_info = await _worker_object_info(worker_id)
         unselected = inspect_h3_workflow(graph, object_info=object_info)
         if body.node_id not in {
             candidate.node_id for candidate in unselected.output_candidates
@@ -356,7 +358,7 @@ def save_h3_import_mapping(
 
 
 @router.post("/imports/{import_id:path}/validate", response_model=None)
-async def validate_h3_import(import_id: str) -> dict[str, Any] | JSONResponse:
+async def validate_h3_import(import_id: str, worker_id: str) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
         graph, workflow_sha256 = store.load_import_workflow_snapshot(import_id)
@@ -416,18 +418,16 @@ async def validate_h3_import(import_id: str) -> dict[str, Any] | JSONResponse:
     except ProfileStorageError as exc:
         return _store_error(exc)
 
-    client = ComfyMcpClient()
     try:
+        client = get_worker_registry().client_for(worker_id)
         comfy_payload = await client.validate_workflow(filled)
-    except ComfyMcpError as exc:
+    except ComfyError as exc:
         return _error(
             422,
             "dependency_validation_failed",
             str(exc),
             {"import_id": import_id},
         )
-    finally:
-        await client.aclose()
 
     try:
         record = store.record_validation_success(
@@ -454,7 +454,11 @@ async def test_h3_import(
     import_id: str,
     body: TestProfileRequest,
 ) -> dict[str, Any] | JSONResponse:
-    """Start an isolated local test against a validated, unactivated import."""
+    """Start an isolated remote test against a validated, unactivated import."""
+    try:
+        get_worker_registry().client_for(body.worker_id)
+    except ComfyError as exc:
+        return _error(422, "worker_unavailable", str(exc))
     store = H3ProfileStore()
     try:
         workflow_sha256, mapping_sha256 = store.testable_import_identity(import_id)
@@ -502,6 +506,7 @@ async def test_h3_import(
         params={
             "h3_provider": "local",
             "h3_profile_test": True,
+            "worker_id": body.worker_id,
             "h3_profile_import_id": import_id,
             "h3_profile_test_workflow_sha256": workflow_sha256,
             "h3_profile_test_mapping_sha256": mapping_sha256,

@@ -168,7 +168,7 @@ def _sync_ref_frame(job: JobRecord) -> None:
                     )
                 )
             )
-        return
+        raise RuntimeError(f"Failed to save generated Layout to Asset Library: {exc}") from exc
 
     if target is not None:
         append_to_active = target.activation_mode == "append"

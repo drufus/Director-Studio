@@ -40,9 +40,8 @@ vi.mock("../features/settings/WorkflowSettingsPage", () => ({
 }));
 
 vi.mock("../shared/api/client", () => ({
-  fetchHealth: vi.fn().mockResolvedValue({
-    comfy_reachable: true,
-    comfy_error: null,
+  fetchRenderWorkers: vi.fn().mockResolvedValue({
+    workers: [{ id: "worker-a", base_url: "http://worker-a:8188", status: "up", checked_at: null, error: null, queued_jobs: 0, running_jobs: 0 }],
   }),
 }));
 
@@ -259,14 +258,14 @@ describe("App mode routing", () => {
     expect(screen.queryByText("03")).toBeNull();
   });
 
-  it("uses the Director mark and labels the compact ComfyUI status", async () => {
+  it("uses the Director mark and labels the render worker fleet status", async () => {
     render(<App />);
 
     const mark = screen.getByLabelText("Director Studio brand");
     expect(mark.querySelector("svg")).toBeTruthy();
     expect(mark.textContent).not.toContain("DS");
-    expect(await screen.findByLabelText("ComfyUI online")).toBeTruthy();
-    expect(screen.getByText("ComfyUI")).toBeTruthy();
+    expect(await screen.findByLabelText("Render workers: 1/1 up")).toBeTruthy();
+    expect(screen.getByText("Render workers: 1/1 up")).toBeTruthy();
   });
 
   it("starts desktop projects in the project-wide Director workspace", () => {

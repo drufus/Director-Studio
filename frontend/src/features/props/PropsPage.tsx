@@ -1,3 +1,4 @@
+import { RenderJobInfo } from "../../shared/components/RenderJobInfo";
 import { useEffect, useMemo, useState } from "react";
 import { ImageUploadSlot, type LocalImage } from "../../shared/components/ImageUploadSlot";
 import { Lightbox } from "../../shared/components/Lightbox";
@@ -296,6 +297,7 @@ export function PropsPage({ onOpenLibrary }: Props) {
             </p>
           ) : null}
 
+          <RenderJobInfo job={job} />
           {job?.error && (job.status === "failed" || job.status === "cancelled") ? (
             <div className="banner error">{job.error}</div>
           ) : null}

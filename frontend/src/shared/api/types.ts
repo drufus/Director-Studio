@@ -1,5 +1,38 @@
 /** Shared job / media types used across features. */
 
+export interface RenderWorkerStatus {
+  id: string;
+  base_url: string;
+  status: "up" | "down" | "unknown";
+  checked_at: string | null;
+  error: string | null;
+  queued_jobs: number | null;
+  running_jobs: number | null;
+}
+
+/** Optional on jobs created before remote worker scheduling was introduced. */
+export interface SharedRenderJobMetadata {
+  worker_id?: string | null;
+  worker_url?: string | null;
+  worker_selected_at?: string | null;
+  worker_selection?: Record<string, unknown>;
+  memory_admission?: RenderMemoryAdmission | null;
+  expected_artifacts?: Record<string, unknown>;
+}
+
+export interface RenderMemoryAdmission {
+  checked_at: string;
+  worker_id: string;
+  worker_url: string;
+  ram_free_bytes: number | null;
+  ram_total_bytes: number | null;
+  devices: { index: number; name: string; vram_free_bytes: number | null; vram_total_bytes: number | null }[];
+  min_free_ram_bytes: number | null;
+  min_free_vram_bytes: number | null;
+  accepted: boolean;
+  error: string | null;
+}
+
 export interface H3ActiveProfile {
   profile_id: string;
   display_name: string;

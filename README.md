@@ -2,7 +2,7 @@
 
 Local-first pre-production workspace for planning shots, managing reusable visual and voice assets, writing MiniMax H3 Ref2AV prompts, and generating media through ComfyUI.
 
-Director Studio runs the planning agent through a configured OpenAI-compatible provider (including LiteLLM) or local Ollama. Image and local video workflows run in ComfyUI through ComfyUI MCP; H3 video can alternatively be submitted to the official MiniMax API.
+Director Studio runs the planning agent through a configured OpenAI-compatible provider (including LiteLLM) or local Ollama. Image and local video workflows run on configured remote ComfyUI workers over HTTP; H3 video can alternatively be submitted to the official MiniMax API.
 
 Core features include a typed asset library, actor and set workflows, conversational shot planning, editable Picture and Audio references, optional Layout studies, six-section H3 prompts, local/cloud video submission, durable jobs, and independent or exclusive GPU coordination.
 
@@ -12,14 +12,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source layout and exten
 
 | Layer | Tech |
 |-------|------|
-| Backend | FastAPI · pluggable pipelines · ComfyUI MCP · pluggable Director LLM |
+| Backend | FastAPI · pluggable pipelines · ComfyUI HTTP · pluggable Director LLM |
 | Frontend | Vite + React · feature folders |
-| Execution | ComfyUI through MCP (actor / scene / prop / Layout / local H3) · MiniMax H3 official API |
+| Execution | Remote ComfyUI workers (actor / scene / prop / Layout / local H3) · MiniMax H3 official API |
 | Planning LLM | OpenAI-compatible/LiteLLM or local Ollama |
 
 ## Native macOS and Linux setup
 
-The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The cluster port is staged: native startup and LiteLLM planning with independent GPU coordination are implemented. Remote worker routing and systemd deployment follow in separate changes; Comfy execution still uses the legacy MCP transport. Configure remote planning using [LLM provider settings](docs/LLM-PROVIDERS.md).
+The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The cluster port is staged: native startup and LiteLLM planning with independent GPU coordination are implemented. Remote worker routing, HTTP file movement, durable job pinning, and H3 memory admission are implemented. Worker-bound H3 profile activation evidence and systemd deployment remain separate phases. Configure [remote workers](docs/REMOTE-WORKERS.md) and [LLM provider settings](docs/LLM-PROVIDERS.md).
 
 Install Python 3.11+ (3.12 recommended), Node.js 22.12+ with npm, and FFmpeg/ffprobe on `PATH`. On macOS, Homebrew can provide `python@3.12`, `node@22`, and `ffmpeg`; follow its instructions to put the selected executables on `PATH`. On Ubuntu/DGX OS, install `python3-venv`, `python3-pip`, and `ffmpeg`, plus a supported Node.js version.
 
@@ -34,7 +34,9 @@ For backend reload, use `DS_RELOAD=true ./start.sh`. For frontend editing, run `
 
 See [native setup and checks](docs/NATIVE-SETUP.md) for interpreter selection, persistent paths, and the Windows-only test quarantine. PowerShell and PyInstaller files below are retained as legacy artifacts and are excluded from the native CI workflow.
 
-## Windows portable installation
+## Windows portable installation (legacy)
+
+These retained instructions describe the retired Windows/MCP release. They are outside the native macOS/Linux build and CI path. Use the native setup above for current source deployments.
 
 The portable package runs Director Studio locally as one `DirectorStudio.exe`. The UI and backend are included; Ollama and ComfyUI remain external local services. The included installer creates a private Python environment for `comfy-cli` and `comfy-mcp`.
 
@@ -392,11 +394,11 @@ API: `/api/actors/*` · `GET /api/pipelines`
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `DS_COMFY_BASE_URL` | `http://127.0.0.1:8188` | ComfyUI |
-| `DS_H3_PROVIDER` | `local` | `local` = ComfyUI MCP; `minimax` = official cloud API |
-| `DS_COMFY_MCP_COMMAND` | `comfy-mcp` | ComfyUI MCP executable; Portable installer writes its absolute path |
-| `DS_COMFY_MCP_ARGS` | empty | Optional extra command-line arguments passed to the MCP server process |
-| `DS_COMFY_MCP_COMFY_BIN` | `comfy` | comfy-cli executable used by the MCP server |
+| `DS_COMFY_WORKERS` | empty | Explicit CSV of `name=http://host:port`; shipped example configures only beastviii |
+| `DS_COMFY_MIN_FREE_RAM_GIB` | unset | Required minimum free system RAM before H3 submission |
+| `DS_COMFY_MIN_FREE_VRAM_GIB` | unset | Required minimum free device VRAM before H3 submission |
+| `DS_COMFY_BASE_URL` | `http://127.0.0.1:8188` | Legacy exclusive-GPU model release only; never selects render workers |
+| `DS_H3_PROVIDER` | `local` | `local` = remote ComfyUI HTTP; `minimax` = official cloud API |
 | `DS_HOST` | `127.0.0.1` | Listener address |
 | `DS_PORT` | `8790` | API port |
 | `DS_RELOAD` | `false` | Explicit backend reload for source development |

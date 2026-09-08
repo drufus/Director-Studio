@@ -1,3 +1,4 @@
+import { RenderJobInfo } from "../../shared/components/RenderJobInfo";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   EMPTY_PROMPT_SECTIONS,
@@ -41,7 +42,7 @@ function ProductionWorkflowProfile({ profile, error, job }: {
     <div className="production-workflow-profile">
       {profile ? (
         <>
-          <span>{`Local · ComfyUI — ${profile.display_name}`}</span>
+          <span>{`Render workers · ComfyUI — ${profile.display_name}`}</span>
           <small>{`Workflow: ${profile.display_name}`}</small>
           {profile.warning ? (
             <div className="banner" role="status">
@@ -52,7 +53,7 @@ function ProductionWorkflowProfile({ profile, error, job }: {
         </>
       ) : (
         <span className="muted">
-          {error ? `Workflow status unavailable: ${error}` : "Loading local workflow…"}
+          {error ? `Workflow status unavailable: ${error}` : "Loading worker workflow…"}
         </span>
       )}
       {job?.h3_profile_id ? (
@@ -538,7 +539,7 @@ export function ProductionPage({
         disabled={busy || jobActive}
         onChange={(event) => setH3Provider(event.target.value as H3Provider)}
       >
-        <option value="local">Local · ComfyUI</option>
+        <option value="local">Render workers · ComfyUI</option>
         <option value="minimax" disabled={!h3ProviderStatus?.minimax_configured}>
           MiniMax · Official API
           {h3ProviderStatus && !h3ProviderStatus.minimax_configured
@@ -549,7 +550,7 @@ export function ProductionPage({
       <small>
         {h3Provider === "minimax"
           ? `Official API · ${h3ProviderStatus?.minimax_resolution || "768P"}`
-          : "Local ComfyUI workflow"}
+          : "ComfyUI worker workflow"}
       </small>
     </label>
   );
@@ -624,9 +625,10 @@ export function ProductionPage({
               ) : (
                 <p className="mobile-production-empty-inline">No final video for this shot yet.</p>
               )}
+              <RenderJobInfo job={h3Job} />
               {h3Job?.error ? (
                 <div className="mobile-production-job-error" role="status">
-                  Generation failed. Open desktop Production for diagnostic details.
+                  {h3Job.error}
                 </div>
               ) : null}
               {providerPicker}
@@ -1086,8 +1088,9 @@ export function ProductionPage({
                           <span className="job-id">{h3Job.id}</span>
                         </div>
                         <div className="field-hint">
-                          Provider: {h3Job.h3_provider === "minimax" ? "MiniMax · Official API" : "Local · ComfyUI"}
+                          Provider: {h3Job.h3_provider === "minimax" ? "MiniMax · Official API" : "Render workers · ComfyUI"}
                         </div>
+                        <RenderJobInfo job={h3Job} />
                         {h3Job.error ? (
                           <div className="banner error">{h3Job.error}</div>
                         ) : null}

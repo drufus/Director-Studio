@@ -101,6 +101,11 @@ async def test_resume_job_collects_existing_prompt_without_resubmitting(
     )
     job.status = JobStatus.running
     job.comfy_prompt_id = "prompt-existing"
+    from app.core.comfy.artifacts import image_manifest
+
+    job.worker_id = "test-worker"
+    job.worker_url = "http://test-worker.invalid:8188"
+    job.expected_artifacts = image_manifest({"1": {}}, {"1": ["layout"]})
     store.save_job(job)
 
     class FakePipeline:
@@ -119,7 +124,10 @@ async def test_resume_job_collects_existing_prompt_without_resubmitting(
             return None
 
     fake_client = SimpleNamespace(
-        wait_for_completion=AsyncMock(return_value={"outputs": {}}),
+        wait_for_completion=AsyncMock(return_value={
+            "status": {"completed": True, "status_str": "success", "messages": []},
+            "outputs": {"1": {"images": [{"filename": "layout.png", "subfolder": "", "type": "output"}]}},
+        }),
         download_image=AsyncMock(return_value=b"layout bytes"),
     )
 
@@ -141,7 +149,8 @@ async def test_resume_job_collects_existing_prompt_without_resubmitting(
             self.released.append(job_id)
 
     monkeypatch.setattr(runner, "get_pipeline", lambda _pipeline_id: FakePipeline())
-    monkeypatch.setattr(runner, "ComfyClient", lambda: fake_client)
+    monkeypatch.setattr(runner, "_bind_worker", AsyncMock(return_value=fake_client))
+    monkeypatch.setattr(runner, "_release_worker", AsyncMock())
     fake_orchestrator = FakeOrchestrator()
     monkeypatch.setattr(runner, "get_orchestrator", lambda: fake_orchestrator)
 

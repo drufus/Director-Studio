@@ -1,4 +1,4 @@
-import type { JobStatus, OutputSlot, PromptSections } from "../../shared/api/types";
+import type { SharedRenderJobMetadata, JobStatus, OutputSlot, PromptSections } from "../../shared/api/types";
 
 export type { PromptSections };
 
@@ -45,7 +45,7 @@ export interface ShotFileMaps {
 }
 
 /** H3 job row as returned for JSON Production polling. */
-export interface JsonShotJobRecord {
+export interface JsonShotJobRecord extends SharedRenderJobMetadata {
   id: string;
   status: JobStatus;
   name: string;

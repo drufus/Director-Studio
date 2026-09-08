@@ -5,7 +5,7 @@ import { DirectorPage, type DirectorChatRequest } from "../features/director/Dir
 import { materialReviewMessage } from "../features/director/materialReview";
 import { JsonProductionPage } from "../features/json-production/JsonProductionPage";
 import { ProductionPage } from "../features/production/ProductionPage";
-import { fetchHealth } from "../shared/api/client";
+import { RenderWorkerHealth } from "../shared/components/RenderWorkers";
 import { ProjectProvider, useProject } from "../shared/project/ProjectContext";
 import { ProjectPicker } from "../shared/project/ProjectPicker";
 import { DirectorStudioMark } from "../shared/components/DirectorStudioMark";
@@ -53,6 +53,7 @@ function MobileAppShell() {
           </details>
         </div>
 
+        <RenderWorkerHealth />
         <nav className="mobile-topbar-row mobile-workspace-nav" aria-label="Mobile workspace">
           <button
             type="button"
@@ -103,22 +104,12 @@ function AppShell() {
   const [settingsVisited, setSettingsVisited] = useState(false);
   const [directorRequest, setDirectorRequest] = useState<DirectorChatRequest | null>(null);
   const requestSequence = useRef(0);
-  const [health, setHealth] = useState<{
-    comfy_reachable: boolean;
-    comfy_error: string | null;
-  } | null>(null);
   const { project } = useProject();
   const reviewMaterials = (shot: Shot, shotNumber: number) => {
     requestSequence.current += 1;
     setDirectorRequest(materialReviewRequest(shot, shotNumber, requestSequence.current));
     setPage("director");
   };
-
-  useEffect(() => {
-    fetchHealth()
-      .then((h) => setHealth(h))
-      .catch(() => setHealth({ comfy_reachable: false, comfy_error: "unreachable" }));
-  }, []);
 
   return (
     <div className={`app${page === "director" ? " director-page-active" : ""}`} data-theme="oat-walnut">
@@ -150,14 +141,7 @@ function AppShell() {
             ))}
           </nav>
 
-          <div
-            className={`health ${health?.comfy_reachable ? "ok" : "bad"}`}
-            aria-label={`ComfyUI ${health?.comfy_reachable ? "online" : "offline"}`}
-            title={`ComfyUI ${health?.comfy_reachable ? "online" : "offline"}`}
-          >
-            <span className="dot" />
-            <span className="health-label">ComfyUI</span>
-          </div>
+          <RenderWorkerHealth />
           <button type="button" className="btn secondary topbar-settings" aria-current={page === "settings" ? "page" : undefined} onClick={() => { setSettingsVisited(true); setPage("settings"); }}>Settings</button>
         </div>
       </header>

@@ -95,4 +95,17 @@ describe("generation status formatting", () => {
       ),
     ).toBe("00:00");
   });
+
+  it("counts simultaneous render phases without treating an active worker as waiting", () => {
+    expect(generationStatusText({
+      ...status,
+      chat_locked: false,
+      generation_count: 99,
+      generation_jobs: [
+        status.generation_jobs[1],
+        status.generation_jobs[0],
+        { ...status.generation_jobs[2], status: "running", phase: "saving" },
+      ],
+    }, new Date("2026-08-31T11:30:00Z"))).toBe("2 jobs active (1 generating, 1 saving) · oldest 1:30:00 · 1 job waiting");
+  });
 });

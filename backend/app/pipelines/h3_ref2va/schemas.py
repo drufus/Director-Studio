@@ -5,9 +5,10 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from ...core.schemas import JobRecord, JobStatus, OutputSlot
+from ..job_response import WorkerJobResponse
 
 
-class H3Ref2VaJobResponse(BaseModel):
+class H3Ref2VaJobResponse(WorkerJobResponse):
     id: str
     status: JobStatus
     name: str
@@ -56,6 +57,7 @@ class H3Ref2VaJobResponse(BaseModel):
         except (TypeError, ValueError):
             revision_i = None
         return cls(
+            **cls.worker_fields(job),
             id=job.id,
             status=job.status,
             name=job.name,

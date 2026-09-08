@@ -1,5 +1,5 @@
 import { parseError } from "../../shared/api/client";
-import type { JobStatus, OutputSlot } from "../../shared/api/types";
+import type { SharedRenderJobMetadata, JobStatus, OutputSlot } from "../../shared/api/types";
 
 export type { JobStatus, OutputSlot };
 /** Derived from uploads for display only (workflow auto-routes). */
@@ -13,7 +13,7 @@ export interface JobOutputs {
   asset_sheet?: OutputSlot | null;
 }
 
-export interface JobRecord {
+export interface JobRecord extends SharedRenderJobMetadata {
   id: string;
   status: JobStatus;
   mode: ActorMode;

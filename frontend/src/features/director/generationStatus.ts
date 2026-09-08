@@ -44,10 +44,19 @@ export function generationStatusText(
   const jobs = [...status.generation_jobs].sort(
     (left, right) => Date.parse(left.queued_at) - Date.parse(right.queued_at),
   );
-  const active = jobs[0];
-  if (!active) return "";
-  const elapsed = formatGenerationElapsed(active.queued_at, now);
-  const waiting = Math.max(0, status.generation_count - 1);
+  if (!jobs.length) return "";
+  const activeJobs = jobs.filter((job) => job.phase !== "queued");
+  const primary = activeJobs[0] || jobs[0];
+  const elapsed = formatGenerationElapsed(primary.queued_at, now);
+  const waiting = jobs.filter((job) => job.phase === "queued").length - (activeJobs.length ? 0 : 1);
   const suffix = waiting > 0 ? ` · ${waiting} ${waiting === 1 ? "job" : "jobs"} waiting` : "";
-  return `${phaseLabel(active)} · ${elapsed}${suffix}`;
+  if (activeJobs.length > 1) {
+    const phases = (["uploading", "generating", "saving"] as const)
+      .map((phase) => ({ phase, count: activeJobs.filter((job) => job.phase === phase).length }))
+      .filter(({ count }) => count > 0)
+      .map(({ phase, count }) => `${count} ${phase}`)
+      .join(", ");
+    return `${activeJobs.length} jobs active (${phases}) · oldest ${elapsed}${suffix}`;
+  }
+  return `${phaseLabel(primary)} · ${elapsed}${suffix}`;
 }

@@ -1,4 +1,4 @@
-import type { H3ActiveProfile, H3Profiles, PipelineInfo } from "./types";
+import type { H3ActiveProfile, H3Profiles, PipelineInfo, RenderWorkerStatus } from "./types";
 import type { H3Analysis, H3Import, H3Mapping, H3TestRun, H3Validation } from "../../features/settings/types";
 
 export async function parseError(res: Response): Promise<string> {
@@ -34,6 +34,12 @@ export async function fetchPipelines(): Promise<PipelineInfo[]> {
   return res.json();
 }
 
+export async function fetchRenderWorkers(): Promise<{ workers: RenderWorkerStatus[] }> {
+  const res = await fetch("/api/comfy/workers");
+  if (!res.ok) throw new Error(await parseError(res));
+  return res.json();
+}
+
 const H3_PROFILES = "/api/workflow-profiles/h3";
 async function profileRequest<T>(path = "", method = "GET", body?: unknown): Promise<T> {
   const res = await fetch(`${H3_PROFILES}${path}`, {
@@ -44,6 +50,7 @@ async function profileRequest<T>(path = "", method = "GET", body?: unknown): Pro
   return res.json();
 }
 const importPath = (id: string, action: string) => `/imports/${encodeURIComponent(id)}/${action}`;
+const workerQuery = (workerId: string) => `?${new URLSearchParams({ worker_id: workerId })}`;
 export const fetchH3Profiles = () => profileRequest<H3Profiles>();
 export async function importH3Workflow(file: File): Promise<H3Import> {
   const body = new FormData();
@@ -52,11 +59,11 @@ export async function importH3Workflow(file: File): Promise<H3Import> {
   if (!res.ok) throw new Error(await parseError(res));
   return res.json();
 }
-export const fetchH3ImportAnalysis = (id: string) => profileRequest<H3Analysis>(importPath(id, "analysis"));
-export const selectH3ImportOutput = (id: string, nodeId: string) => profileRequest<H3Analysis>(importPath(id, "output"), "PUT", { node_id: nodeId });
+export const fetchH3ImportAnalysis = (id: string, workerId: string) => profileRequest<H3Analysis>(importPath(id, "analysis") + workerQuery(workerId));
+export const selectH3ImportOutput = (id: string, nodeId: string, workerId: string) => profileRequest<H3Analysis>(importPath(id, "output") + workerQuery(workerId), "PUT", { node_id: nodeId });
 export const saveH3Mapping = (id: string, mapping: H3Mapping) => profileRequest<{ import_id: string; mapping: H3Mapping }>(importPath(id, "mapping"), "PUT", mapping);
-export const validateH3Import = (id: string) => profileRequest<H3Validation>(importPath(id, "validate"), "POST");
-export const testH3Import = (id: string, pictureAssetId: string, audioAssetId: string | null) => profileRequest<H3TestRun>(importPath(id, "test"), "POST", { picture_asset_id: pictureAssetId, audio_asset_id: audioAssetId });
+export const validateH3Import = (id: string, workerId: string) => profileRequest<H3Validation>(importPath(id, "validate") + workerQuery(workerId), "POST");
+export const testH3Import = (id: string, pictureAssetId: string, audioAssetId: string | null, workerId: string) => profileRequest<H3TestRun>(importPath(id, "test"), "POST", { picture_asset_id: pictureAssetId, audio_asset_id: audioAssetId, worker_id: workerId });
 export const selectH3TestOutput = (id: string, artifactIndex: number) => profileRequest<{ import_id: string; artifact_index: number; job_id: string; status: "succeeded" }>(importPath(id, "test-output"), "PUT", { artifact_index: artifactIndex });
 export const activateH3Import = (id: string) => profileRequest<{ import_id: string; profile_id: string; active: H3ActiveProfile }>(importPath(id, "activate"), "POST");
 export const selectH3Profile = (profileId: string) => profileRequest<{ active: H3ActiveProfile }>("/select", "POST", { profile_id: profileId });

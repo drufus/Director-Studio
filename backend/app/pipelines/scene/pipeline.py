@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...core.comfy.artifacts import image_manifest
 from ...core.schemas import ComfyImageRef, JobRecord, LibraryAsset
 from ..base import Pipeline
 from . import workflow
@@ -15,6 +16,14 @@ class ScenePipeline(Pipeline):
         "Qwen Edit 2511 multi-angle scene ref: one scene image → multiple camera angles "
         "(multi-angle LoRA + CR Prompt List). Output files are named by viewpoint."
     )
+
+    def expected_output_manifest(
+        self, job: JobRecord, prompt: dict[str, Any]
+    ) -> dict[str, Any]:
+        stems = job.params.get("output_stems")
+        if not isinstance(stems, list) or not stems:
+            raise ValueError("Scene output stems must be captured before submission")
+        return image_manifest(prompt, {workflow.NODE_SAVE: stems})
 
     @property
     def output_labels(self) -> dict[str, str]:

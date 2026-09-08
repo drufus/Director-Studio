@@ -1,3 +1,5 @@
+import { useRenderWorkers } from "../../shared/components/RenderWorkers";
+import { RenderJobInfo } from "../../shared/components/RenderJobInfo";
 import { useEffect, useRef, useState } from "react";
 import {
   activateH3Import,
@@ -34,15 +36,15 @@ const STATUS_LABELS: Record<H3LifecycleStatus, string> = {
 };
 type Operation = "idle" | "loading" | "importing" | "saving" | "validating" | "testing" | "activating" | "selecting";
 
-function remember(importId: string, test?: H3TestRun) {
+function remember(importId: string, workerId: string, test?: H3TestRun) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ importId, test }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ importId, workerId, test }));
   } catch {
     // Runtime setup still works when browser storage is unavailable.
   }
 }
 
-function remembered(): { importId?: string; test?: H3TestRun } {
+function remembered(): { importId?: string; workerId?: string; test?: H3TestRun } {
   try {
     return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
   } catch {
@@ -75,6 +77,9 @@ function mappingFor(analysis: H3Analysis, h3NodeId: string, seedNodeId: string):
 
 export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
   const { projectId } = useProject();
+  const { workers, error: workerError } = useRenderWorkers(active);
+  const [workerId, setWorkerId] = useState(() => remembered().workerId || "");
+  const workerReady = Boolean(workers?.some((worker) => worker.id === workerId && worker.status === "up") && !workerError);
   const [profiles, setProfiles] = useState<H3Profiles | null>(null);
   const [selectedWorkflow, setSelectedWorkflow] = useState("");
   const [analysis, setAnalysis] = useState<H3Analysis | null>(null);
@@ -92,6 +97,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
   const [pollVersion, setPollVersion] = useState(0);
   const errorRef = useRef<HTMLDivElement>(null);
   const busy = operation !== "idle";
+  const testActive = Boolean(test && (!job || ["queued", "uploading", "running"].includes(job.status)));
 
   const applyAnalysis = (next: H3Analysis) => {
     setAnalysis(next);
@@ -124,8 +130,8 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
         if (cancelled) return;
         setProfiles(current);
         setSelectedWorkflow(current.active.profile_id);
-        if (saved.importId) {
-          const next = await fetchH3ImportAnalysis(saved.importId);
+        if (saved.importId && saved.workerId) {
+          const next = await fetchH3ImportAnalysis(saved.importId, saved.workerId);
           if (cancelled) return;
           applyAnalysis(next);
           if (saved.test && saved.test.import_id === saved.importId) setTest(saved.test);
@@ -192,7 +198,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
           setOperation("idle");
           return;
         }
-        const current = await fetchH3ImportAnalysis(test.import_id);
+        const current = await fetchH3ImportAnalysis(test.import_id, workerId);
         if (current.lifecycle.status !== "tested") {
           evidenceAttempts += 1;
           if (evidenceAttempts >= 5) throw new Error("Test completed, but its result is not available yet.");
@@ -200,7 +206,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
           return;
         }
         applyAnalysis(current);
-        remember(current.import_id);
+        remember(current.import_id, workerId);
         setTest(null);
         setOperation("idle");
       } catch (err) {
@@ -212,7 +218,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
     };
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [test, pollVersion]);
+  }, [test, pollVersion, workerId]);
 
   const outputCandidates = analysis?.output_candidates || [];
   const selectedOutput = analysis?.selected_output_node_id || mapping?.output.node_id || "";
@@ -223,8 +229,8 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
         .filter(([key, slot]) => key.startsWith("video_candidate_") && slot.url)
         .sort(([left], [right]) => left.localeCompare(right, undefined, { numeric: true }))
     : [];
-  const canValidate = Boolean(mapping && analysis && stage === "mapped" && !busy);
-  const canTest = Boolean(mapping && picture && ["validated", "tested"].includes(stage) && !busy);
+  const canValidate = Boolean(mapping && analysis && stage === "mapped" && workerReady && !busy);
+  const canTest = Boolean(mapping && picture && ["validated", "tested"].includes(stage) && workerReady && !busy && !testActive);
   const canActivate = Boolean(analysis && stage === "tested" && !busy);
 
   return (
@@ -233,7 +239,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
         <h2 id="active-workflow-title" className="section-card-title">Current Workflow</h2>
         {profiles ? <>
           <strong className="workflow-profile-name">{profiles.active.display_name}</strong>
-          <p className="field-hint">Local H3 jobs use this ComfyUI workflow.</p>
+          <p className="field-hint">H3 render workers use this ComfyUI workflow.</p>
           <label className="field">
             <span>Installed workflow</span>
             <select value={selectedWorkflow} disabled={busy} onChange={(event) => setSelectedWorkflow(event.target.value)}>
@@ -254,14 +260,36 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
         <section className="section-card" aria-labelledby="custom-h3-title">
           <h2 id="custom-h3-title" className="section-card-title">Custom H3 Workflows</h2>
           <p className="field-hint">Import a ComfyUI API JSON. Director Studio leaves the internal graph unchanged and only connects its input and final-video boundaries.</p>
-          <label className="field"><span>Import Workflow</span><input type="file" accept=".json,application/json" disabled={busy} onChange={(event) => {
+          <label className="field"><span>Worker for discovery and test</span>
+            <select aria-label="Worker for discovery and test" value={workerId} disabled={busy || testActive} onChange={(event) => {
+              const nextWorker = event.target.value;
+              setWorkerId(nextWorker);
+              setJob(null);
+              setTest(null);
+              const importId = analysis?.import_id || remembered().importId;
+              remember(importId || "", nextWorker);
+              if (importId && nextWorker) void perform("loading", async () => {
+                const next = await fetchH3ImportAnalysis(importId, nextWorker);
+                applyAnalysis(next);
+                if (next.mapping) setStage("mapped");
+              });
+            }}>
+              <option value="">Choose a render worker…</option>
+              {workerId && workers && !workers.some((worker) => worker.id === workerId) ? <option value={workerId}>{workerId} — no longer configured</option> : null}
+              {(workers || []).map((worker) => <option key={worker.id} value={worker.id}>{worker.id} — {worker.status}</option>)}
+            </select>
+          </label>
+          {workerError ? <div className="banner error" role="alert">{workerError}</div> : null}
+          {workerId && workers?.find((worker) => worker.id === workerId)?.error ? <div className="banner error">{workers.find((worker) => worker.id === workerId)!.error}</div> : null}
+          <p className="field-hint">Metadata, validation and the test render use this worker. Test jobs stay assigned to it.</p>
+          <label className="field"><span>Import Workflow</span><input type="file" accept=".json,application/json" disabled={busy || !workerReady} onChange={(event) => {
             const file = event.target.files?.[0];
             event.target.value = "";
             if (file) void perform("importing", async () => {
               setAnalysis(null); setMapping(null); setJob(null); setTest(null); setStage("draft");
               const imported = await importH3Workflow(file);
-              remember(imported.import_id);
-              applyAnalysis(await fetchH3ImportAnalysis(imported.import_id));
+              remember(imported.import_id, workerId);
+              applyAnalysis(await fetchH3ImportAnalysis(imported.import_id, workerId));
             });
           }} /></label>
           {analysis ? <>
@@ -274,7 +302,7 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
           <h2 id="output-title" className="section-card-title">1. Final video output</h2>
           <p className="field-hint">Choose the terminal node whose video Director Studio should keep. Node name is shown first; ID is secondary.</p>
           {analysis ? <label className="field"><span>Final video node</span><select aria-label="Final video node" value={selectedOutput} disabled={busy} onChange={(event) => void perform("selecting", async () => {
-            const next = await selectH3ImportOutput(analysis.import_id, event.target.value);
+            const next = await selectH3ImportOutput(analysis.import_id, event.target.value, workerId);
             applyAnalysis(next);
           })}><option value="">Choose a final video node…</option>{outputCandidates.map((candidate) => <option key={candidate.node_id} value={candidate.node_id}>{nodeLabel(candidate)}</option>)}</select></label> : null}
         </section>
@@ -295,8 +323,8 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
             {mapping ? <div className="workflow-dependencies"><strong>Connected inputs</strong><p>Prompt, width, height, frames · Picture 1–9 · Audio 1–3 · optional seed</p></div> : null}
             <button type="button" className="btn secondary" disabled={busy || !mapping} onClick={() => void perform("saving", async () => {
               await saveH3Mapping(analysis.import_id, mapping!);
-              applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id));
-              remember(analysis.import_id);
+              applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id, workerId));
+              remember(analysis.import_id, workerId);
             })}>Confirm input nodes</button>
           </> : <p className="empty-copy">Choose the final video output first.</p>}
         </section>
@@ -305,8 +333,8 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
           <div className="section-card-head"><h2 id="test-title" className="section-card-title">3. Validate &amp; Test</h2><span role="status" aria-live="polite">{busy ? `${operation}…` : STATUS_LABELS[stage]}</span></div>
           <p className="field-hint">ComfyUI validates the graph, then a 56-frame test confirms the selected boundary. Multiple videos can be previewed and selected without rerunning.</p>
           <button type="button" className="btn secondary" disabled={!canValidate} onClick={() => analysis && void perform("validating", async () => {
-            await validateH3Import(analysis.import_id);
-            applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id));
+            await validateH3Import(analysis.import_id, workerId);
+            applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id, workerId));
           })}>Validate with ComfyUI</button>
           <div className="workflow-test-assets">
             <label className="field"><span>Picture for test</span><select value={picture} disabled={busy} onChange={(event) => setPicture(event.target.value)}><option value="">Choose one Picture…</option>{pictures.map((asset) => <option key={asset.id} value={asset.id}>{asset.name}</option>)}</select></label>
@@ -316,14 +344,15 @@ export function H3WorkflowSetup({ active = true }: { active?: boolean }) {
             <button type="button" className="btn secondary" disabled={!projectId || busy} onClick={() => setAssetRefresh((value) => value + 1)}>Refresh assets</button>
             <button type="button" className="btn secondary" disabled={!canTest} onClick={() => analysis && void perform("testing", async () => {
               setJob(null);
-              const run = await testH3Import(analysis.import_id, picture, voice || null);
-              remember(analysis.import_id, run); setTest(run); setStage("validated");
+              const run = await testH3Import(analysis.import_id, picture, voice || null, workerId);
+              remember(analysis.import_id, workerId, run); setTest(run); setStage("validated");
             })}>Run 56-frame test</button>
           </div>
+          <RenderJobInfo job={job} />
           {testCandidates.length ? <div className="workflow-test-result"><strong>{testCandidates.length > 1 ? "Choose the final test video" : "Test video"}</strong>{testCandidates.map(([key, slot], index) => <div key={key} className="workflow-test-candidate"><video className="h3-preview" aria-label={`Workflow test video ${index + 1}`} controls preload="metadata" src={slot.url || undefined} />{testCandidates.length > 1 ? <button type="button" className="btn secondary" disabled={busy} onClick={() => analysis && void perform("selecting", async () => {
                 await selectH3TestOutput(analysis.import_id, index);
-                applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id));
-                remember(analysis.import_id); setTest(null);
+                applyAnalysis(await fetchH3ImportAnalysis(analysis.import_id, workerId));
+                remember(analysis.import_id, workerId); setTest(null);
               })}>Use video {index + 1}</button> : null}</div>)}</div> : null}
           <div className="actions"><button type="button" className="btn primary" disabled={!canActivate} onClick={() => analysis && void perform("activating", async () => {
             const result = await activateH3Import(analysis.import_id);

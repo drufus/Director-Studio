@@ -7,15 +7,17 @@ import io
 import json
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.config import settings
-from app.core.jobs.execution_adapters.comfy_mcp import (
-    ComfyMcpExecutionAdapter,
-    ComfyMcpExecutionRuntime,
+from app.core.comfy import ComfyError
+from app.core.jobs.execution_adapters.comfy import (
+    ComfyExecutionAdapter,
+    ComfyExecutionRuntime,
 )
 from app.core.jobs.store import (
     build_output_slots,
@@ -29,7 +31,6 @@ from app.core.library.store import (
     write_asset,
 )
 from app.core.schemas import JobStatus, LibraryAsset
-from app.integrations.comfy_mcp import McpOutputFile
 from app.main import create_app
 from app.pipelines.h3_ref2va.pipeline import H3Ref2VaPipeline
 from app.workflow_profiles.h3 import (
@@ -69,7 +70,7 @@ def test_test_route_preparation_race_persists_failed_job(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"picture_asset_id": actor_picture.id},
+            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id},
         )
     assert response.status_code == 409
     jobs = list_jobs()
@@ -103,6 +104,16 @@ def _import_ready_profile(store: H3ProfileStore) -> str:
     return import_id
 
 
+def _prepare_remote_job(job):
+    pipeline = H3Ref2VaPipeline()
+    pipeline.prepare_job_submission(job)
+    profile = load_job_profile_snapshot(job.id)
+    job.expected_artifacts = pipeline.expected_output_manifest(job, profile.workflow)
+    job.worker_id = "beastviii"
+    job.worker_url = "http://remote-worker:8188"
+    job.worker_selected_at = "2026-09-08T00:00:00Z"
+
+
 def _profile_test_job(store: H3ProfileStore, import_id: str):
     workflow_sha256, mapping_sha256 = store.import_identity(import_id)
     mapping = store.load_import_mapping(import_id)
@@ -122,7 +133,7 @@ def _profile_test_job(store: H3ProfileStore, import_id: str):
         seed=42,
         fixed_seed=True,
     )
-    H3Ref2VaPipeline().prepare_job_submission(job)
+    _prepare_remote_job(job)
     job.status = JobStatus.running
     job.comfy_prompt_id = "prompt_profile_test"
     save_job(job)
@@ -194,12 +205,19 @@ class _CompletedTestClient:
     async def wait_for_completion(self, prompt_id, *, cancel_event):
         assert prompt_id == "prompt_profile_test"
         return {
-            "status": "completed",
-            "outputs_by_node": self.outputs_by_node,
+            "status": {"completed": True, "status_str": "success"},
+            "outputs": {
+                node_id: {"videos": [self._ref(url) for url in urls]}
+                for node_id, urls in self.outputs_by_node.items()
+            },
         }
 
-    async def fetch_outputs(self, prompt_id):
-        assert prompt_id == "prompt_profile_test"
+    @staticmethod
+    def _ref(url):
+        query = parse_qs(urlsplit(url).query, keep_blank_values=True)
+        return {key: query[key][0] for key in ("filename", "subfolder", "type")}
+
+    async def download_image(self, filename, *, subfolder, folder_type):
         if self.phase == "during":
             assert self.cancel_event is not None
             self.cancel_event.set()
@@ -208,26 +226,29 @@ class _CompletedTestClient:
             await asyncio.sleep(0)
             assert self.cancel_event is not None
             self.cancel_event.set()
-        return [
-            McpOutputFile(
-                filename=f"downloaded-{index}.mp4",
-                source_url=url,
-                data=f"mapped-video-{index}".encode(),
-            )
-            for index, url in enumerate(
-                url for urls in self.outputs_by_node.values() for url in urls
-            )
-        ]
+        assert any(
+            self._ref(url) == {"filename": filename, "subfolder": subfolder, "type": folder_type}
+            for urls in self.outputs_by_node.values() for url in urls
+        )
+        return f"mapped-video-{filename}".encode()
 
 
-def _runtime(client) -> ComfyMcpExecutionRuntime:
-    async def no_op(_job):
+def _runtime(client) -> ComfyExecutionRuntime:
+    from app.core.jobs.runner import _save_completed_outputs
+
+    async def no_op(*args):
         return None
 
-    return ComfyMcpExecutionRuntime(
-        client_factory=lambda: client,
-        prepare=no_op,
-        finish=no_op,
+    async def bind_worker(job, *, allow_selection):
+        assert allow_selection is False
+        assert job.worker_id == "beastviii"
+        assert job.worker_url == "http://remote-worker:8188"
+        return client
+
+    return ComfyExecutionRuntime(
+        bind_worker=bind_worker, release_worker=no_op, admit_h3=no_op,
+        prepare=no_op, finish=no_op, update_phase=no_op,
+        save_completed_outputs=_save_completed_outputs,
     )
 
 
@@ -242,6 +263,14 @@ def test_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         settings, "workflow_profiles_dir", data_root / "workflow_profiles"
     )
     monkeypatch.setattr(settings, "h3_provider", "local")
+
+    class Registry:
+        def client_for(self, worker_id):
+            if worker_id != "beastviii":
+                raise ComfyError(f"Unknown render worker: {worker_id}")
+            return _CompletedTestClient()
+
+    monkeypatch.setattr("app.api.h3_workflow_profiles.get_worker_registry", Registry)
     return data_root
 
 
@@ -273,7 +302,7 @@ def voice_asset(test_env: Path):
     return write_asset(asset)
 
 
-def test_test_run_creates_isolated_56_frame_local_h3_job(
+def test_test_run_creates_isolated_56_frame_remote_h3_job(
     test_env: Path,
     actor_picture,
     monkeypatch: pytest.MonkeyPatch,
@@ -283,7 +312,7 @@ def test_test_run_creates_isolated_56_frame_local_h3_job(
 
     async def capture_start(job, *, images=None):
         assert images is not None
-        H3Ref2VaPipeline().prepare_job_submission(job)
+        _prepare_remote_job(job)
         save_job(job)
         return job
 
@@ -293,7 +322,7 @@ def test_test_run_creates_isolated_56_frame_local_h3_job(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"picture_asset_id": actor_picture.id, "audio_asset_id": None},
+            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id, "audio_asset_id": None},
         )
 
     assert response.status_code == 202, response.text
@@ -306,6 +335,8 @@ def test_test_run_creates_isolated_56_frame_local_h3_job(
     assert job.params["width"] == 864
     assert job.params["height"] == 480
     assert job.params["h3_provider"] == "local"
+    assert job.params["worker_id"] == "beastviii"
+    assert job.worker_id == "beastviii"
     assert job.params["h3_profile_import_id"] == import_id
     assert job.params["h3_profile_test"] is True
     assert job.params["image_keys"] == ["picture_1"]
@@ -340,7 +371,7 @@ def test_test_run_resolves_optional_voice_asset(
 
     async def capture_start(job, *, images=None):
         captured_inputs.update(images or {})
-        H3Ref2VaPipeline().prepare_job_submission(job)
+        _prepare_remote_job(job)
         save_job(job)
         return job
 
@@ -351,6 +382,7 @@ def test_test_run_resolves_optional_voice_asset(
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
             json={
+                "worker_id": "beastviii",
                 "picture_asset_id": actor_picture.id,
                 "audio_asset_id": voice_asset.id,
             },
@@ -364,9 +396,30 @@ def test_test_run_resolves_optional_voice_asset(
     assert captured_inputs["audio_1"] == ("reference.wav", b"RIFF-test-voice")
 
 
+@pytest.mark.parametrize("worker_fields", [{}, {"worker_id": "unknown-worker"}])
+def test_remote_test_requires_a_configured_explicit_worker(
+    test_env, actor_picture, worker_fields
+):
+    from app.core.jobs.store import list_jobs
+
+    import_id = _import_ready_profile(H3ProfileStore())
+    with TestClient(create_app()) as client:
+        response = client.post(
+            f"/api/workflow-profiles/h3/imports/{import_id}/test",
+            json={"picture_asset_id": actor_picture.id, **worker_fields},
+        )
+    assert response.status_code == 422
+    if worker_fields:
+        assert response.json()["code"] == "worker_unavailable"
+        assert "unknown-worker" in response.json()["message"]
+    else:
+        assert any(item["loc"] == ["body", "worker_id"] for item in response.json()["detail"])
+    assert list_jobs() == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["during", "after"])
-async def test_comfy_mcp_cancellation_while_fetching_never_records_test_evidence(
+async def test_comfy_http_cancellation_while_fetching_never_records_test_evidence(
     test_env: Path,
     phase: str,
 ) -> None:
@@ -376,7 +429,7 @@ async def test_comfy_mcp_cancellation_while_fetching_never_records_test_evidence
     cancel_event = asyncio.Event()
     client = _CompletedTestClient(cancel_event, phase=phase)
 
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         cancel_event,
@@ -394,21 +447,21 @@ async def test_failure_persisting_final_success_never_records_test_evidence(
     test_env: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from app.core.jobs.execution_adapters import comfy_mcp
+    from app.core.jobs.execution_adapters import comfy
 
     store = H3ProfileStore()
     import_id = _import_ready_profile(store)
     job = _profile_test_job(store, import_id)
-    real_save_job = comfy_mcp.store.save_job
+    real_save_job = comfy.store.save_job
 
     def fail_final_success(candidate):
         if candidate.status == JobStatus.succeeded:
             raise OSError("final job persistence failed")
         real_save_job(candidate)
 
-    monkeypatch.setattr(comfy_mcp.store, "save_job", fail_final_success)
+    monkeypatch.setattr(comfy.store, "save_job", fail_final_success)
 
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         asyncio.Event(),
@@ -474,7 +527,7 @@ async def test_mapped_test_video_records_same_identity_and_allows_activation(
     import_id = _import_ready_profile(store)
 
     async def capture_start(job, *, images=None):
-        H3Ref2VaPipeline().prepare_job_submission(job)
+        _prepare_remote_job(job)
         save_job(job)
         return job
 
@@ -484,7 +537,7 @@ async def test_mapped_test_video_records_same_identity_and_allows_activation(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"picture_asset_id": actor_picture.id},
+            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id},
         )
 
     job = load_job(response.json()["job_id"])
@@ -492,7 +545,7 @@ async def test_mapped_test_video_records_same_identity_and_allows_activation(
     job.status = JobStatus.running
     job.comfy_prompt_id = "prompt_profile_test"
     save_job(job)
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         asyncio.Event(),
@@ -526,7 +579,7 @@ async def test_profile_test_keeps_all_videos_from_confirmed_output_node_only(
     first = "http://comfy/view?filename=first.mp4&subfolder=&type=output"
     second = "http://comfy/view?filename=second.mp4&subfolder=&type=output"
 
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         asyncio.Event(),
@@ -557,7 +610,7 @@ async def test_profile_test_fails_when_only_an_unselected_node_emits_video(
     job = _profile_test_job(store, import_id)
     other = "http://comfy/view?filename=wrong.mp4&subfolder=&type=output"
 
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         asyncio.Event(),
@@ -567,7 +620,7 @@ async def test_profile_test_fails_when_only_an_unselected_node_emits_video(
     terminal = load_job(job.id)
     assert terminal is not None
     assert terminal.status == JobStatus.failed
-    assert "mapped outputs" in (terminal.error or "")
+    assert "Required output node 999" in (terminal.error or "")
     assert not (store.import_workflow_path(import_id).parent / "test.json").exists()
 
 
@@ -580,7 +633,7 @@ async def test_selecting_observed_test_video_does_not_rerun_and_allows_activatio
     job = _profile_test_job(store, import_id)
     first = "http://comfy/view?filename=first.mp4&subfolder=&type=output"
     second = "http://comfy/view?filename=second.mp4&subfolder=&type=output"
-    await ComfyMcpExecutionAdapter().resume(
+    await ComfyExecutionAdapter().resume(
         job,
         H3Ref2VaPipeline(),
         asyncio.Event(),

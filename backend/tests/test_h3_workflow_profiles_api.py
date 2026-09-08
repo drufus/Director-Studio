@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import settings
+from app.core.comfy import ComfyError
 from app.main import create_app
 from app.workflow_profiles.h3 import H3ProfileStore
 
@@ -44,7 +45,7 @@ def profile_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 },
             }
 
-    class ValidatingClient:
+    class ValidatingClient(MetadataClient):
         async def validate_workflow(self, graph):
             assert any(
                 node.get("class_type") == "MiniMaxH3ReferenceToVideo"
@@ -55,10 +56,13 @@ def profile_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         async def aclose(self):
             return None
 
-    monkeypatch.setattr("app.api.h3_workflow_profiles.ComfyClient", MetadataClient)
-    monkeypatch.setattr(
-        "app.api.h3_workflow_profiles.ComfyMcpClient", ValidatingClient
-    )
+    class Registry:
+        def client_for(self, worker_id):
+            if worker_id != "beastviii":
+                raise ComfyError(f"Unknown render worker: {worker_id}")
+            return ValidatingClient()
+
+    monkeypatch.setattr("app.api.h3_workflow_profiles.get_worker_registry", Registry)
     with TestClient(create_app()) as client:
         yield client
 
@@ -74,7 +78,7 @@ def _import(client: TestClient, workflow: bytes, name: str = "custom.api.json") 
 
 def _select_output_and_mapping(client: TestClient, import_id: str, node_id="92"):
     base = f"/api/workflow-profiles/h3/imports/{import_id}"
-    selected = client.put(f"{base}/output", json={"node_id": node_id})
+    selected = client.put(f"{base}/output?worker_id=beastviii", json={"node_id": node_id})
     assert selected.status_code == 200, selected.text
     mapping = selected.json()["mapping"]
     saved = client.put(f"{base}/mapping", json=mapping)
@@ -88,7 +92,7 @@ def test_import_lists_named_output_then_reverse_discovers_h3(
     import_id = _import(profile_client, sample_api_json, "Cinema H3.api.json")
     base = f"/api/workflow-profiles/h3/imports/{import_id}"
 
-    analysis = profile_client.get(f"{base}/analysis")
+    analysis = profile_client.get(f"{base}/analysis?worker_id=beastviii")
     assert analysis.status_code == 200
     output = analysis.json()["output_candidates"][0]
     assert output["node_id"] == "92"
@@ -96,7 +100,7 @@ def test_import_lists_named_output_then_reverse_discovers_h3(
     assert output["class_type"] == "SaveVideo"
     assert analysis.json()["h3_candidates"] == []
 
-    selected = profile_client.put(f"{base}/output", json={"node_id": "92"})
+    selected = profile_client.put(f"{base}/output?worker_id=beastviii", json={"node_id": "92"})
     assert selected.status_code == 200
     body = selected.json()
     assert body["h3_candidates"][0]["node_id"] == "136"
@@ -134,9 +138,9 @@ def test_output_change_invalidates_mapping_and_lifecycle(
     import_id = _import(profile_client, json.dumps(graph).encode())
     base = f"/api/workflow-profiles/h3/imports/{import_id}"
     _select_output_and_mapping(profile_client, import_id)
-    assert profile_client.get(f"{base}/analysis").json()["lifecycle"]["status"] == "mapped"
+    assert profile_client.get(f"{base}/analysis?worker_id=beastviii").json()["lifecycle"]["status"] == "mapped"
 
-    changed = profile_client.put(f"{base}/output", json={"node_id": "999"})
+    changed = profile_client.put(f"{base}/output?worker_id=beastviii", json={"node_id": "999"})
 
     assert changed.status_code == 200
     assert changed.json()["mapping"] is not None
@@ -151,7 +155,7 @@ def test_rejects_nonterminal_or_unknown_output_selection(
     import_id = _import(profile_client, sample_api_json)
 
     response = profile_client.put(
-        f"/api/workflow-profiles/h3/imports/{import_id}/output",
+        f"/api/workflow-profiles/h3/imports/{import_id}/output?worker_id=beastviii",
         json={"node_id": "136"},
     )
 
@@ -167,7 +171,7 @@ def test_confirmed_boundary_validates_without_agent(
     _select_output_and_mapping(profile_client, import_id)
 
     response = profile_client.post(
-        f"/api/workflow-profiles/h3/imports/{import_id}/validate"
+        f"/api/workflow-profiles/h3/imports/{import_id}/validate?worker_id=beastviii"
     )
 
     assert response.status_code == 200, response.text
@@ -180,7 +184,7 @@ def test_mapping_must_match_selected_output(
 ) -> None:
     import_id = _import(profile_client, sample_api_json)
     mapping = profile_client.put(
-        f"/api/workflow-profiles/h3/imports/{import_id}/output",
+        f"/api/workflow-profiles/h3/imports/{import_id}/output?worker_id=beastviii",
         json={"node_id": "92"},
     ).json()["mapping"]
     mapping["output"]["node_id"] = "136"
@@ -219,7 +223,7 @@ def test_routes_reject_non_opaque_ids_with_structured_errors(
     profile_client: TestClient,
 ) -> None:
     response = profile_client.get(
-        "/api/workflow-profiles/h3/imports/..%2Foutside/analysis"
+        "/api/workflow-profiles/h3/imports/..%2Foutside/analysis?worker_id=beastviii"
     )
 
     assert response.status_code == 400
@@ -235,7 +239,7 @@ def test_profile_listing_starts_on_builtin_official(profile_client: TestClient) 
     assert body["active"]["contract_version"] == 2
 
 
-def test_analysis_survives_object_info_failure_with_warning(
+def test_analysis_reports_selected_worker_metadata_failure_without_fallback(
     profile_client: TestClient,
     sample_api_json: bytes,
     monkeypatch: pytest.MonkeyPatch,
@@ -244,19 +248,54 @@ def test_analysis_survives_object_info_failure_with_warning(
 
     class OfflineMetadataClient:
         async def get_object_info(self):
-            raise RuntimeError("offline")
+            raise ComfyError("Worker beastviii object_info unavailable: offline")
 
-    monkeypatch.setattr(
-        "app.api.h3_workflow_profiles.ComfyClient", OfflineMetadataClient
-    )
+    class OfflineRegistry:
+        def client_for(self, worker_id):
+            assert worker_id == "beastviii"
+            return OfflineMetadataClient()
+
+    monkeypatch.setattr("app.api.h3_workflow_profiles.get_worker_registry", OfflineRegistry)
 
     response = profile_client.get(
-        f"/api/workflow-profiles/h3/imports/{import_id}/analysis"
+        f"/api/workflow-profiles/h3/imports/{import_id}/analysis?worker_id=beastviii"
     )
 
-    assert response.status_code == 200
-    assert response.json()["output_candidates"]
-    assert any(
-        item["code"] == "object_info_unavailable"
-        for item in response.json()["issues"]
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Worker beastviii object_info unavailable: offline"
+    assert "output_candidates" not in response.json()
+
+
+@pytest.mark.parametrize("method,endpoint,body", [
+    ("GET", "analysis", None), ("PUT", "output", {"node_id": "92"}),
+    ("POST", "validate", None),
+])
+def test_worker_metadata_operations_require_explicit_worker(
+    profile_client, sample_api_json, method, endpoint, body
+):
+    import_id = _import(profile_client, sample_api_json)
+    response = profile_client.request(
+        method, f"/api/workflow-profiles/h3/imports/{import_id}/{endpoint}", json=body
     )
+    assert response.status_code == 422
+    assert any(item["loc"] == ["query", "worker_id"] for item in response.json()["detail"])
+
+
+@pytest.mark.parametrize("method,endpoint,body,status", [
+    ("GET", "analysis", None, 503),
+    ("PUT", "output", {"node_id": "92"}, 503),
+    ("POST", "validate", None, 422),
+])
+def test_unknown_worker_cannot_use_another_workers_metadata(
+    profile_client, sample_api_json, method, endpoint, body, status
+):
+    import_id = _import(profile_client, sample_api_json)
+    _select_output_and_mapping(profile_client, import_id)
+    response = profile_client.request(
+        method,
+        f"/api/workflow-profiles/h3/imports/{import_id}/{endpoint}?worker_id=unknown-worker",
+        json=body,
+    )
+    assert response.status_code == status
+    assert "Unknown render worker: unknown-worker" in response.text
+    assert H3ProfileStore().import_lifecycle(import_id)["status"] == "mapped"

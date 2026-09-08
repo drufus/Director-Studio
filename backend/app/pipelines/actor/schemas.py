@@ -5,6 +5,7 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 from ...core.schemas import JobRecord, JobStatus, LibraryAsset, OutputSlot
+from ..job_response import WorkerJobResponse
 from .workflow import derive_mode
 
 
@@ -24,7 +25,7 @@ class ActorJobOutputs(BaseModel):
     asset_sheet: OutputSlot | None = None
 
 
-class ActorJobResponse(BaseModel):
+class ActorJobResponse(WorkerJobResponse):
     id: str
     status: JobStatus
     mode: ActorMode
@@ -68,6 +69,7 @@ class ActorJobResponse(BaseModel):
             mode = ActorMode.text
         outs = job.outputs or {}
         return cls(
+            **cls.worker_fields(job),
             id=job.id,
             status=job.status,
             mode=mode,
