@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import uuid
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlparse
 
 import httpx
-from ollama import AsyncClient
 
 from ...config import settings
 
@@ -29,16 +30,24 @@ def _merge_thinking(data: dict[str, Any]) -> str:
     return text
 
 
-def _err_text(r: httpx.Response) -> str:
-    try:
-        return (r.text or "")[:500]
-    except Exception:
-        return f"HTTP {r.status_code}"
+def _failure(cause: str):
+    from ..llm.provider import LLMProviderError
+    return LLMProviderError(f"ollama: {cause}")
 
 
-def _is_multimodal_rejected(body: str) -> bool:
-    b = (body or "").lower()
-    return "multimodal" in b or "does not support multimodal" in b
+def _require_verified_vision(model: str) -> None:
+    from ..llm.provider import configured_capabilities
+    if not configured_capabilities(model)["vision"]:
+        raise _failure("image support is not explicitly verified; configure DS_LLM_VISION_MODELS")
+
+
+def _check_completion(data: dict[str, Any], *, allow_empty: bool = False) -> None:
+    if data.get("done") is not True or data.get("done_reason") not in {"stop", "tool_calls", "load", "unload"}:
+        raise _failure("incomplete or rejected completion")
+    message = data.get("message") or {}
+    content = data.get("response") or message.get("content") or ""
+    if not allow_empty and not content.strip() and not message.get("tool_calls"):
+        raise _failure("empty final completion")
 
 
 class OllamaClient:
@@ -132,6 +141,8 @@ class OllamaClient:
         options: dict[str, Any] | None = None,
     ) -> str:
         """Non-streaming generate. Forces GPU offload via num_gpu when possible."""
+        if images:
+            _require_verified_vision(model)
         body: dict[str, Any] = {
             "model": model,
             "prompt": prompt,
@@ -147,32 +158,11 @@ class OllamaClient:
 
         async with httpx.AsyncClient(timeout=self._timeout) as client:
             r = await client.post(f"{self.base_url}/api/generate", json=body)
-            if r.status_code >= 400 and images:
-                err = _err_text(r)
-                if _is_multimodal_rejected(err):
-                    logger.warning(
-                        "model %s rejects multimodal generate; text-only fallback",
-                        model,
-                    )
-                    body.pop("images", None)
-                    r = await client.post(f"{self.base_url}/api/generate", json=body)
-                else:
-                    logger.warning(
-                        "generate+images failed (%s): %s; trying /api/chat",
-                        r.status_code,
-                        err,
-                    )
-                    try:
-                        return await self.chat(
-                            model, prompt, images=images, keep_alive=keep_alive
-                        )
-                    except Exception:
-                        body.pop("images", None)
-                        r = await client.post(
-                            f"{self.base_url}/api/generate", json=body
-                        )
-            r.raise_for_status()
-            return _merge_thinking(r.json())
+            if r.status_code >= 400:
+                raise _failure(f"generation request rejected, HTTP {r.status_code}")
+            data = r.json()
+            _check_completion(data, allow_empty=not prompt.strip())
+            return _merge_thinking(data)
 
     async def chat_response(
         self,
@@ -185,10 +175,12 @@ class OllamaClient:
         options: dict[str, Any] | None = None,
         require_vision: bool = False,
     ) -> dict[str, Any]:
-        """Return a provider-neutral chat result using Ollama's official SDK."""
+        """Use Ollama HTTP directly so native call IDs survive normalization."""
+        if require_vision or any(message.get("images") for message in messages):
+            _require_verified_vision(model)
         request: dict[str, Any] = {
             "model": model,
-            "messages": [dict(message) for message in messages],
+            "messages": copy.deepcopy(list(messages)),
             "stream": False,
             "options": self._opts(options),
         }
@@ -201,25 +193,33 @@ class OllamaClient:
         elif getattr(settings, "llm_keep_loaded", True):
             request["keep_alive"] = "60m"
 
-        client = AsyncClient(host=self.base_url, timeout=self._timeout)
+        # Ollama accepts structured tool arguments; replay preserves call IDs.
+        for message in request["messages"]:
+            for call in message.get("tool_calls") or []:
+                arguments = call.get("function", {}).get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        parsed = json.loads(arguments)
+                    except ValueError:
+                        raise _failure("invalid tool arguments in replay") from None
+                    if not isinstance(parsed, dict):
+                        raise _failure("tool replay arguments must be a JSON object")
+                    call["function"] = {**call["function"], "arguments": parsed}
         try:
-            response = await client.chat(**request)
-        except Exception as exc:
-            has_images = any(message.get("images") for message in request["messages"])
-            if require_vision or not has_images or not _is_multimodal_rejected(str(exc)):
-                raise
-            logger.warning(
-                "chat+images failed for %s: %s — falling back to text",
-                model,
-                str(exc)[:500],
-            )
-            for message in request["messages"]:
-                message.pop("images", None)
-            response = await client.chat(**request)
-
-        close = getattr(client, "close", None)
-        if close is not None:
-            await close()
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                raw_response = await client.post(f"{self.base_url}/api/chat", json=request)
+                if not 200 <= raw_response.status_code < 300:
+                    raise _failure(f"chat request rejected, HTTP {raw_response.status_code}")
+                try:
+                    response = raw_response.json()
+                except ValueError:
+                    raise _failure("invalid chat response JSON") from None
+        except httpx.TimeoutException:
+            raise _failure("chat request timed out") from None
+        except (httpx.HTTPError, OSError):
+            raise _failure("chat request transport failed") from None
+        if not isinstance(response, dict):
+            raise _failure("invalid chat response")
 
         message = getattr(response, "message", None)
         if message is None and isinstance(response, dict):
@@ -231,95 +231,41 @@ class OllamaClient:
             return getattr(obj, key, default)
 
         normalized_calls: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
         for call in list(_value(message, "tool_calls", []) or []):
             function = _value(call, "function", {}) or {}
-            name = str(_value(function, "name", "") or "").strip()
-            arguments = _value(function, "arguments", {}) or {}
+            name = _value(function, "name", "")
+            arguments = _value(function, "arguments", {})
             if isinstance(arguments, str):
                 try:
                     arguments = json.loads(arguments)
-                except json.JSONDecodeError:
-                    arguments = {}
-            if name:
-                normalized_calls.append(
-                    {
-                        "name": name,
-                        "arguments": dict(arguments) if isinstance(arguments, dict) else {},
-                    }
-                )
+                except ValueError:
+                    raise _failure("invalid tool arguments JSON") from None
+            if not isinstance(name, str) or not name.strip() or not isinstance(arguments, dict):
+                raise _failure("invalid tool call name or arguments")
+            provided_id = _value(call, "id")
+            if provided_id is None:
+                call_id = f"ollama_{uuid.uuid4().hex}"
+            elif not isinstance(provided_id, str) or not provided_id.strip():
+                raise _failure("invalid tool call ID")
+            else:
+                call_id = provided_id
+            if call_id in seen_ids:
+                raise _failure("duplicate tool call ID")
+            seen_ids.add(call_id)
+            normalized_calls.append({"id": call_id, "name": name, "arguments": arguments})
 
         result = {
             "content": str(_value(message, "content", "") or ""),
             "thinking": str(_value(message, "thinking", "") or ""),
             "tool_calls": normalized_calls,
+            "done_reason": str(_value(response, "done_reason", "") or ""),
         }
-        done_reason = str(_value(response, "done_reason", "") or "")
-        if done_reason:
-            result["done_reason"] = done_reason
+        if _value(response, "done") is not True or result["done_reason"] not in {"stop", "tool_calls"}:
+            raise _failure("incomplete or rejected chat completion")
+        if not result["content"].strip() and not normalized_calls:
+            raise _failure("empty final chat completion")
         return result
-
-    async def _chat_http_legacy(
-        self,
-        model: str,
-        prompt: str,
-        *,
-        system: str | None = None,
-        images: Sequence[str] | None = None,
-        keep_alive: str | int | None = None,
-        options: dict[str, Any] | None = None,
-        require_vision: bool = False,
-    ) -> str:
-        """/api/chat — with vision fallback to text when model has no multimodal."""
-        messages: list[dict[str, Any]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        user_msg: dict[str, Any] = {"role": "user", "content": prompt}
-        if images:
-            user_msg["images"] = list(images)
-        messages.append(user_msg)
-
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "options": self._opts(options),
-        }
-        if keep_alive is not None:
-            body["keep_alive"] = keep_alive
-        elif getattr(settings, "llm_keep_loaded", True):
-            body["keep_alive"] = "60m"
-
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.post(f"{self.base_url}/api/chat", json=body)
-            if r.status_code >= 400 and images:
-                err = _err_text(r)
-                if require_vision:
-                    r.raise_for_status()
-                logger.warning(
-                    "chat+images failed for %s (%s): %s — falling back to text",
-                    model,
-                    r.status_code,
-                    err,
-                )
-                # Drop images; keep text (VISION captions already in prompt if any)
-                user_msg.pop("images", None)
-                messages[-1] = user_msg
-                body["messages"] = messages
-                note = (
-                    "\n\n(System note: current model does not accept images; "
-                    "answered from text captions only.)"
-                )
-                if isinstance(user_msg.get("content"), str):
-                    user_msg["content"] = str(user_msg["content"]) + note
-                r = await client.post(f"{self.base_url}/api/chat", json=body)
-            r.raise_for_status()
-            data = r.json()
-            msg = data.get("message") or {}
-            thinking = data.get("thinking") or msg.get("thinking") or ""
-            text = str(msg.get("content") or data.get("response") or "")
-            if thinking and "<think>" not in text.lower():
-                return f"<think>{thinking}</think>\n{text}"
-            return text
 
     async def chat(
         self,
@@ -333,7 +279,7 @@ class OllamaClient:
         require_vision: bool = False,
         format: dict[str, Any] | str | None = None,
     ) -> str:
-        """Text convenience wrapper over the official SDK chat response."""
+        """Text convenience wrapper over the normalized chat response."""
         messages: list[dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -365,30 +311,14 @@ class OllamaClient:
         keep_alive: str | int | None = None,
         options: dict[str, Any] | None = None,
     ):
-        """Stream tokens. Vision path falls back to text stream on multimodal 400."""
+        """Stream once; preserve image input and surface incomplete streams."""
         if images:
-            try:
-                async for item in self.chat_stream(
-                    model,
-                    prompt,
-                    system=system,
-                    images=images,
-                    keep_alive=keep_alive,
-                    options=options,
-                ):
-                    yield item
-                return
-            except httpx.HTTPStatusError as e:
-                err = _err_text(e.response) if e.response is not None else str(e)
-                logger.warning(
-                    "vision stream failed (%s); text stream fallback: %s",
-                    getattr(e.response, "status_code", "?"),
-                    err,
-                )
-                # fall through to text generate_stream
-                images = None
-                if system:
-                    prompt = f"{system}\n\n{prompt}\n\n(System note: model cannot view images.)"
+            async for item in self.chat_stream(
+                model, prompt, system=system, images=images,
+                keep_alive=keep_alive, options=options,
+            ):
+                yield item
+            return
 
         body: dict[str, Any] = {
             "model": model,
@@ -396,6 +326,8 @@ class OllamaClient:
             "stream": True,
             "options": self._opts(options),
         }
+        if system:
+            body["system"] = system
         if keep_alive is not None:
             body["keep_alive"] = keep_alive
         elif getattr(settings, "llm_keep_loaded", True):
@@ -409,21 +341,33 @@ class OllamaClient:
                     # read body for better error
                     await r.aread()
                 r.raise_for_status()
+                completed = False
+                has_content = False
                 async for line in r.aiter_lines():
                     if not line:
                         continue
                     try:
                         data = json.loads(line)
-                    except Exception:
-                        continue
+                    except ValueError:
+                        raise _failure("invalid stream JSON") from None
+                    if not isinstance(data, dict) or data.get("error"):
+                        raise _failure("invalid or rejected stream event")
                     chunk = data.get("response")
                     think = data.get("thinking") or data.get("reasoning")
                     if think:
                         yield {"kind": "think", "text": str(think)}
                     if chunk:
+                        has_content = has_content or bool(str(chunk).strip())
                         yield {"kind": "token", "text": str(chunk)}
                     if data.get("done"):
+                        if data.get("done_reason") != "stop":
+                            raise _failure("incomplete or rejected stream completion")
+                        completed = True
                         break
+                if not completed:
+                    raise _failure("stream disconnected before complete termination")
+                if not has_content:
+                    raise _failure("empty final stream completion")
 
     async def chat_stream(
         self,
@@ -436,6 +380,8 @@ class OllamaClient:
         options: dict[str, Any] | None = None,
     ):
         """Stream /api/chat."""
+        if images:
+            _require_verified_vision(model)
         messages: list[dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -462,19 +408,31 @@ class OllamaClient:
                 if r.status_code >= 400:
                     await r.aread()
                 r.raise_for_status()
+                completed = False
+                has_content = False
                 async for line in r.aiter_lines():
                     if not line:
                         continue
                     try:
                         data = json.loads(line)
-                    except Exception:
-                        continue
+                    except ValueError:
+                        raise _failure("invalid stream JSON") from None
+                    if not isinstance(data, dict) or data.get("error"):
+                        raise _failure("invalid or rejected stream event")
                     msg = data.get("message") or {}
                     think = data.get("thinking") or msg.get("thinking")
                     chunk = msg.get("content") or data.get("response")
                     if think:
                         yield {"kind": "think", "text": str(think)}
                     if chunk:
+                        has_content = has_content or bool(str(chunk).strip())
                         yield {"kind": "token", "text": str(chunk)}
                     if data.get("done"):
+                        if data.get("done_reason") != "stop":
+                            raise _failure("incomplete or rejected stream completion")
+                        completed = True
                         break
+                if not completed:
+                    raise _failure("stream disconnected before complete termination")
+                if not has_content:
+                    raise _failure("empty final stream completion")

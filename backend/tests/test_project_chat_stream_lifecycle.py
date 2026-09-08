@@ -108,6 +108,7 @@ async def test_late_generation_race_keeps_the_accepted_user_message(
     )
 
     class RaceOrchestrator:
+        shared_gpu_enabled = True
         async def generation_reservations(self):
             return []
 

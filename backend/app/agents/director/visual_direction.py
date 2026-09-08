@@ -327,7 +327,6 @@ async def analyze_ref_frame(
         ),
         images=ollama_images,
         require_vision=True,
-        keep_alive="10m",
         options={"temperature": 0.1},
         format=VisualBrief.model_json_schema(),
     )
@@ -341,7 +340,6 @@ async def analyze_ref_frame(
                     _generation_prompt_repair_prompt(brief, captions, missing_refs),
                     guides=("reference-strategy", "reference-frame-generation"),
                 ),
-                keep_alive="10m",
                 options={"temperature": 0.0},
                 format=GenerationPromptRepair.model_json_schema(),
             )
@@ -350,7 +348,7 @@ async def analyze_ref_frame(
             brief = brief.model_copy(
                 update={"generation_prompt": repaired.generation_prompt.strip()}
             )
-        except Exception:
+        except (ValueError, TypeError):
             pass
     compiled = compile_visual_prompt(shot, brief, captions=captions)
     selected = [

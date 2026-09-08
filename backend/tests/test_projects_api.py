@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from pathlib import Path
 from typing import Iterable
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -27,6 +28,7 @@ from app.core.vram import GenerationActiveError, GenerationReservation
 
 
 class _LockedChatOrchestrator:
+    shared_gpu_enabled = True
     def __init__(self) -> None:
         self.reservations = [
             GenerationReservation(
@@ -1156,7 +1158,7 @@ def test_previously_unlocked_project_can_change_script(client):
 
 
 @pytest.mark.asyncio
-async def test_ollama_plan_provider_forwards_requested_guides(monkeypatch):
+async def test_director_plan_provider_forwards_requested_guides(monkeypatch):
     from app.api import projects as projects_api
 
     captured: list[tuple[str, tuple[str, ...]]] = []
@@ -1172,7 +1174,7 @@ async def test_ollama_plan_provider_forwards_requested_guides(monkeypatch):
             return "ok"
 
     monkeypatch.setattr(projects_api, "with_director_skill", capture_skill)
-    provider = projects_api.OllamaPlanProvider(model="qwen-test")
+    provider = projects_api.DirectorPlanProvider(model="qwen-test")
     provider.client = _Client()
 
     result = await provider.complete(
@@ -1691,7 +1693,7 @@ async def test_make_chat_fn_forwards_stage_guides_to_director_skill(monkeypatch)
         return task
 
     class FakeOllama:
-        async def chat(self, model, user, *, system, images):
+        async def chat(self, model, user, *, system, images, require_vision):
             return "ok"
 
         async def generate(self, model, prompt):
@@ -1715,6 +1717,10 @@ async def test_make_chat_fn_forwards_stage_guides_to_director_skill(monkeypatch)
 
     monkeypatch.setattr(projects_api, "with_director_skill", capture_skill)
     monkeypatch.setattr("app.core.vram.get_orchestrator", lambda: FakeOrchestrator())
+    monkeypatch.setattr(projects_api, "get_llm_provider", lambda: SimpleNamespace(
+        client=FakeOrchestrator.ollama,
+        capabilities=lambda model: {"vision": True, "vision_reason": "verified test"},
+    ))
     monkeypatch.setattr(
         "app.core.vram.director_model.get_director_model", lambda: "vision-model"
     )
@@ -1732,7 +1738,7 @@ async def test_make_chat_fn_forwards_stage_guides_to_director_skill(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_make_chat_fn_falls_back_to_text_tool_protocol_on_ollama_xml_error(
+async def test_make_chat_fn_surfaces_native_tool_error_without_protocol_retry(
     monkeypatch,
 ):
     from app.api import projects as projects_api
@@ -1766,30 +1772,32 @@ async def test_make_chat_fn_falls_back_to_text_tool_protocol_on_ollama_xml_error
             return None
 
     monkeypatch.setattr("app.core.vram.get_orchestrator", lambda: FakeOrchestrator())
+    monkeypatch.setattr(projects_api, "get_llm_provider", lambda: SimpleNamespace(
+        client=FakeOrchestrator.ollama,
+        capabilities=lambda model: {"vision": True, "vision_reason": "verified test"},
+    ))
     monkeypatch.setattr(
         "app.core.vram.director_model.get_director_model", lambda: "qwen-test"
     )
 
     chat_fn = await projects_api._make_chat_fn()
-    result = await chat_fn(
-        "SYSTEM",
-        "Use the status tool",
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_status",
-                    "description": "Read status",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ],
-    )
+    with pytest.raises(RuntimeError, match="XML syntax error"):
+        await chat_fn(
+            "SYSTEM",
+            "Use the status tool",
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_status",
+                        "description": "Read status",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
 
-    assert result == '```json\n{"tool":"get_status","params":{}}\n```'
-    assert len(generated_prompts) == 1
-    assert '"name": "get_status"' in generated_prompts[0]
-    assert '"tool":"tool_name","params"' in generated_prompts[0]
+    assert generated_prompts == []
 
 
 @pytest.mark.asyncio
@@ -1832,6 +1840,10 @@ async def test_make_chat_fn_forces_single_gpt_tool_through_structured_output(
             return None
 
     monkeypatch.setattr("app.core.vram.get_orchestrator", lambda: FakeOrchestrator())
+    monkeypatch.setattr(projects_api, "get_llm_provider", lambda: SimpleNamespace(
+        client=FakeOrchestrator.ollama,
+        capabilities=lambda model: {"vision": True, "vision_reason": "verified test"},
+    ))
     monkeypatch.setattr(
         "app.core.vram.director_model.get_director_model", lambda: "qwen-test"
     )
@@ -1907,6 +1919,10 @@ async def test_make_chat_fn_forces_single_actor_design_tool_through_structured_o
             return None
 
     monkeypatch.setattr("app.core.vram.get_orchestrator", lambda: FakeOrchestrator())
+    monkeypatch.setattr(projects_api, "get_llm_provider", lambda: SimpleNamespace(
+        client=FakeOrchestrator.ollama,
+        capabilities=lambda model: {"vision": True, "vision_reason": "verified test"},
+    ))
     monkeypatch.setattr(
         "app.core.vram.director_model.get_director_model", lambda: "qwen-test"
     )

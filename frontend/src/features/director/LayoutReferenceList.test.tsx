@@ -97,6 +97,27 @@ function renderList(
 describe("LayoutReferenceList", () => {
   afterEach(cleanup);
 
+  it("disables layout discussion when image support becomes unavailable and keeps its draft", () => {
+    const onDiscussAddReference = vi.fn();
+    const props = { shot: baseShot, busy: false, onDiscussAddReference, onOpenImage: vi.fn() };
+    const { rerender } = render(<LayoutReferenceList {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add reference frame" }));
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Check the actor's entrance position." } });
+
+    const reason = "Selected model does not support layout image analysis.";
+    rerender(<LayoutReferenceList {...props} visualDisabledReason={reason} />);
+
+    for (const name of ["Add reference frame", "Discuss with Director"]) {
+      const button = screen.getByRole("button", { name }) as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      expect(button.title).toBe(reason);
+      fireEvent.click(button);
+    }
+    expect((screen.getByLabelText("Description") as HTMLTextAreaElement).disabled).toBe(true);
+    expect(screen.getByDisplayValue("Check the actor's entrance position.")).toBeTruthy();
+    expect(onDiscussAddReference).not.toHaveBeenCalled();
+  });
+
   it("collapses completed Layout details until the user opens them", () => {
     const { container } = renderList(baseShot);
     const details = Array.from(

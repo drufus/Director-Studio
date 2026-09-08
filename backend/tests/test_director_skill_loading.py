@@ -96,7 +96,7 @@ async def test_plan_provider_embeds_storyboard_validation_stage_guide():
             prompts.append(prompt)
             return '{"valid": true, "issues": []}'
 
-    provider = projects_api.OllamaPlanProvider(model="qwen-test")
+    provider = projects_api.DirectorPlanProvider(model="qwen-test")
     provider.client = _Client()
 
     result = await provider.complete(
@@ -129,7 +129,7 @@ async def test_plan_provider_loads_latest_director_skill_before_every_call(
             prompts.append(prompt)
             return "ok"
 
-    provider = projects_api.OllamaPlanProvider(model="qwen-test")
+    provider = projects_api.DirectorPlanProvider(model="qwen-test")
     provider.client = _Client()
 
     await provider.complete("TASK SYSTEM", "TASK USER")
@@ -144,7 +144,7 @@ async def test_plan_provider_loads_latest_director_skill_before_every_call(
 
 
 @pytest.mark.asyncio
-async def test_project_chat_loads_director_skill_before_ollama(
+async def test_project_chat_loads_director_skill_before_provider(
     tmp_path, monkeypatch
 ):
     skill_path = tmp_path / "SKILL.md"
@@ -177,6 +177,8 @@ async def test_project_chat_loads_director_skill_before_ollama(
     import app.core.vram as vram_module
     import app.core.vram.director_model as model_module
 
+    from types import SimpleNamespace
+    monkeypatch.setattr(projects_api, "get_llm_provider", lambda: SimpleNamespace(client=_Ollama()))
     monkeypatch.setattr(vram_module, "get_orchestrator", lambda: _Orchestrator())
     monkeypatch.setattr(model_module, "get_director_model", lambda: "qwen-test")
 

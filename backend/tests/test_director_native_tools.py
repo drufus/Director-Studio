@@ -1751,6 +1751,7 @@ async def test_native_save_storyboard_rejects_stale_hash_as_a_tool_failure(
                 "thinking": "",
                 "tool_calls": [
                     {
+                        "id": "router-issued-stable-id",
                         "name": "save_storyboard",
                         "arguments": {
                             "expected_script_hash": "obsolete",
@@ -1785,6 +1786,11 @@ async def test_native_save_storyboard_rejects_stale_hash_as_a_tool_failure(
         for message in captured_followup["messages"]
         if message.get("role") == "tool"
     )
+    assistant_message = next(message for message in captured_followup["messages"] if message.get("tool_calls"))
+    assistant_call = assistant_message["tool_calls"][0]
+    assert assistant_call["id"] == "router-issued-stable-id"
+    assert tool_message["tool_call_id"] == assistant_call["id"]
+    assert json.loads(assistant_call["function"]["arguments"])["expected_script_hash"] == "obsolete"
     payload = json.loads(tool_message["content"])
     assert payload["ok"] is False
     assert "stale" in payload["error"]
@@ -3865,37 +3871,23 @@ async def test_llm_chat_does_not_persist_predicted_runtime_as_business_steps(tmp
 async def test_ollama_chat_response_passes_native_tools_and_json_schema(monkeypatch):
     from app.core.vram import ollama_client as module
 
+    import httpx
+    import json
+
     requests: list[dict] = []
-
-    class _Message:
-        content = "done"
-        thinking = "checked"
-        tool_calls = [
-            type(
-                "ToolCall",
-                (),
-                {
-                    "function": type(
-                        "Function",
-                        (),
-                        {"name": "get_status", "arguments": {}},
-                    )()
-                },
-            )()
-        ]
-
-    class _Response:
-        message = _Message()
-
-    class _AsyncClient:
-        def __init__(self, **kwargs):
-            requests.append({"client": kwargs})
-
-        async def chat(self, **kwargs):
-            requests.append(kwargs)
-            return _Response()
-
-    monkeypatch.setattr(module, "AsyncClient", _AsyncClient)
+    def handler(request):
+        requests.append(json.loads(request.content))
+        assert request.url.path == "/api/chat"
+        return httpx.Response(200, json={
+            "done": True, "done_reason": "stop",
+            "message": {"content": "done", "thinking": "checked", "tool_calls": [
+                {"function": {"name": "get_status", "arguments": {}}}
+            ]},
+        })
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: original_client(
+        **kwargs, transport=httpx.MockTransport(handler),
+    ))
     schema = {
         "type": "object",
         "properties": {"summary": {"type": "string"}},
@@ -3919,14 +3911,17 @@ async def test_ollama_chat_response_passes_native_tools_and_json_schema(monkeypa
         format=schema,
     )
 
-    assert result == {
-        "content": "done",
-        "thinking": "checked",
-        "tool_calls": [{"name": "get_status", "arguments": {}}],
-    }
-    assert requests[1]["tools"] == tools
-    assert requests[1]["format"] == schema
-    assert requests[1]["options"] == {
+    assert result["content"] == "done"
+    assert result["thinking"] == "checked"
+    assert result["done_reason"] == "stop"
+    assert len(result["tool_calls"]) == 1
+    call = result["tool_calls"][0]
+    assert call["id"]
+    assert call["name"] == "get_status"
+    assert call["arguments"] == {}
+    assert requests[0]["tools"] == tools
+    assert requests[0]["format"] == schema
+    assert requests[0]["options"] == {
         "num_gpu": 999,
         "num_ctx": 32_768,
         "num_predict": 4_096,

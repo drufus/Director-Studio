@@ -10,16 +10,21 @@ class FakeProvider:
 
     def __init__(self) -> None:
         self.selected: tuple[str, bool] | None = None
+        self.current = "reasoner-fast"
 
     async def list_models(self) -> list[str]:
         return ["reasoner-large", "reasoner-fast"]
 
     def model_status(self) -> dict:
-        return {"model": "reasoner-fast", "source": "provider"}
+        return {"model": self.current, "source": "provider"}
 
     def select_model(self, model: str, *, persist: bool) -> str:
         self.selected = (model, persist)
+        self.current = model
         return model
+
+    def capabilities(self, model: str) -> dict:
+        return {"vision": False, "vision_reason": "Not verified."}
 
 
 class EmptySelectionProvider(FakeProvider):
@@ -50,6 +55,8 @@ async def test_director_model_catalog_comes_from_provider() -> None:
         "provider": "fake-remote",
         "reachable": True,
         "available": ["reasoner-large", "reasoner-fast"],
+        "error": None,
+        "capabilities": {"vision": False, "vision_reason": "Not verified."},
     }
 
 
@@ -67,13 +74,13 @@ async def test_director_model_selection_is_delegated_to_provider() -> None:
 
 
 @pytest.mark.asyncio
-async def test_director_selects_first_installed_model_when_unset() -> None:
+async def test_director_keeps_selection_blank_when_unset() -> None:
     provider = EmptySelectionProvider(["local-first:latest", "local-second:latest"])
 
     result = await director.get_model(provider=provider)
 
-    assert provider.selected == ("local-first:latest", True)
-    assert result["model"] == "local-first:latest"
+    assert provider.selected is None
+    assert result["model"] == ""
     assert result["available"] == ["local-first:latest", "local-second:latest"]
 
 

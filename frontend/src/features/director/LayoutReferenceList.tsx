@@ -10,6 +10,7 @@ import { isDisplayableLayout, isRetiredLayout } from "../../shared/layoutReferen
 interface LayoutReferenceListProps {
   shot: Shot;
   busy: boolean;
+  visualDisabledReason?: string;
   onDiscussAddReference: (description: string) => void;
   onOpenImage: (assetId: string) => void;
 }
@@ -130,7 +131,7 @@ function LayoutReferenceCard({
   );
 }
 
-export function LayoutReferenceList({ shot, busy, onDiscussAddReference, onOpenImage }: LayoutReferenceListProps) {
+export function LayoutReferenceList({ shot, busy, visualDisabledReason, onDiscussAddReference, onOpenImage }: LayoutReferenceListProps) {
   const layouts = shot.layout_refs;
   const displayableLayouts = layouts.filter(isDisplayableLayout);
   const currentLayouts = displayableLayouts.filter((layout) => !isRetiredLayout(layout));
@@ -140,7 +141,7 @@ export function LayoutReferenceList({ shot, busy, onDiscussAddReference, onOpenI
 
   const discuss = () => {
     const trimmed = description.trim();
-    if (!trimmed) return;
+    if (!trimmed || busy || visualDisabledReason) return;
     onDiscussAddReference(trimmed);
     setDescription("");
     setAdding(false);
@@ -176,7 +177,8 @@ export function LayoutReferenceList({ shot, busy, onDiscussAddReference, onOpenI
           <button
             type="button"
             className="mode-chip"
-            disabled={busy}
+            disabled={busy || Boolean(visualDisabledReason)}
+            title={visualDisabledReason}
             aria-expanded={adding}
             onClick={() => setAdding((open) => !open)}
           >
@@ -189,12 +191,12 @@ export function LayoutReferenceList({ shot, busy, onDiscussAddReference, onOpenI
                 <textarea
                   rows={3}
                   value={description}
-                  disabled={busy}
+                  disabled={busy || Boolean(visualDisabledReason)}
                   placeholder="What should an additional reference frame help establish?"
                   onChange={(event) => setDescription(event.target.value)}
                 />
               </label>
-              <button type="button" className="btn primary" disabled={busy || !description.trim()} onClick={discuss}>
+              <button type="button" className="btn primary" disabled={busy || Boolean(visualDisabledReason) || !description.trim()} title={visualDisabledReason} onClick={discuss}>
                 Discuss with Director
               </button>
             </div>

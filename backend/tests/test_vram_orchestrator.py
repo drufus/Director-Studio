@@ -338,15 +338,27 @@ async def test_generation_lock_releases_only_after_the_final_job():
 
 
 @pytest.mark.asyncio
-async def test_chat_llm_session_fails_without_warming_ollama_when_reserved():
+@pytest.mark.parametrize(
+    ("status", "phase"),
+    [
+        ("queued", "queued"),
+        ("uploading", "uploading"),
+        ("running", "generating"),
+        ("running", "saving"),
+    ],
+)
+async def test_chat_llm_session_fails_without_warming_ollama_when_reserved(
+    status, phase
+):
     ollama = FakeOllama()
     orch = _orch(ollama=ollama)
+    assert orch.shared_gpu_enabled
     await orch.reserve_generation(
         job_id="job_video",
         pipeline_id="h3_ref2va",
         kind="video",
-        status="queued",
-        phase="queued",
+        status=status,
+        phase=phase,
         queued_at="2026-08-31T10:00:00+00:00",
     )
 

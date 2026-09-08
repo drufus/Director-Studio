@@ -1,110 +1,126 @@
-"""Runtime-selectable Director Ollama model (no service restart).
+"""Provider-scoped runtime selections persisted in data/director_model.json.
 
-Priority:
-1. In-process override (set via API / set_director_model)
-2. Persisted choice under data/director_model.json
-3. settings.director_plan_model (.env DS_DIRECTOR_PLAN_MODEL)
+Priority within the selected provider: runtime override, persisted selection,
+DS_LLM_MODEL, then legacy DS_DIRECTOR_PLAN_MODEL for Ollama only. An explicitly
+blank persisted selection stays blank. Legacy unscoped files belong to Ollama.
 """
-
 from __future__ import annotations
 
 import json
-import logging
+import os
 from pathlib import Path
 from typing import Any
 
 from ...config import settings
 
-logger = logging.getLogger("director_studio.director_model")
+_override: dict[str, str] | None = None
+_PROVIDERS = {"ollama", "openai_compatible"}
 
-_override: str | None = None
+
+class ModelSelectionError(RuntimeError):
+    """Malformed or unreadable selection state must not select another model."""
 
 
 def _persist_path() -> Path:
     return settings.data_dir / "director_model.json"
 
 
-def _read_persisted() -> str | None:
+def _read_selections() -> tuple[dict[str, str], bool]:
     path = _persist_path()
-    if not path.is_file():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        name = (data.get("model") or "").strip()
-        return name or None
-    except Exception:
-        logger.exception("failed to read %s", path)
-        return None
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, False
+    except (OSError, UnicodeError):
+        raise ModelSelectionError("Director model selection file cannot be read.") from None
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict):
+            raise ValueError
+        if "version" not in data and set(data) == {"model"}:
+            if not isinstance(data["model"], str):
+                raise ValueError
+            return {"ollama": data["model"].strip()}, True
+        if data.get("version") != 2 or not isinstance(data.get("selections"), dict):
+            raise ValueError
+        selections = data["selections"]
+        if any(key not in _PROVIDERS or not isinstance(value, str) for key, value in selections.items()):
+            raise ValueError
+        return {key: value.strip() for key, value in selections.items()}, False
+    except (ValueError, TypeError):
+        raise ModelSelectionError("Director model selection file is malformed; repair it explicitly.") from None
 
 
-def _write_persisted(model: str) -> None:
+def _write_selections(selections: dict[str, str]) -> None:
     path = _persist_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"model": model}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temporary = path.with_suffix(".json.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps({"version": 2, "selections": selections}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    except OSError:
+        raise ModelSelectionError("Director model selection could not be persisted.") from None
+
+
+def _provider(provider: str | None = None) -> str:
+    selected = provider or settings.llm_provider
+    if selected not in _PROVIDERS:
+        raise ModelSelectionError("Unknown Director LLM provider.")
+    return selected
+
+
+def model_status(*, provider: str | None = None) -> dict[str, Any]:
+    selected = _provider(provider)
+    selections, legacy = _read_selections()
+    override = (_override or {}).get(selected)
+    persisted = selections.get(selected)
+    env_default = settings.llm_model.strip()
+    if not env_default and selected == "ollama":
+        env_default = settings.director_plan_model.strip()
+    return {
+        "provider": selected,
+        "model": override if override is not None else persisted if persisted is not None else env_default,
+        "override": override,
+        "persisted": persisted,
+        "env_default": env_default,
+        "source": "runtime" if override is not None else "persisted" if persisted is not None else "env",
+        "warning": (
+            "Legacy Ollama model selection was ignored for the OpenAI-compatible provider."
+            if legacy and selected != "ollama" else None
+        ),
+    }
 
 
 def get_director_model() -> str:
-    """Model name used for plan / chat / wake / unload."""
-    if _override:
-        return _override
-    persisted = _read_persisted()
-    if persisted:
-        return persisted
-    return (settings.director_plan_model or "").strip()
+    return model_status()["model"]
 
 
-def set_director_model(model: str, *, persist: bool = True) -> str:
-    """
-    Switch Director LLM at runtime.
-
-    Updates orchestrator unload/warm list and optionally persists across restarts.
-    """
+def set_director_model(model: str, *, persist: bool = True, provider: str | None = None) -> str:
     global _override
-    name = (model or "").strip()
-    if not name:
-        raise ValueError("model name must be non-empty")
-
-    _override = name
+    selected = _provider(provider)
+    name = model.strip()
+    selections, _ = _read_selections()
     if persist:
-        _write_persisted(name)
-
-    # Keep VRAM orchestrator in sync (unload/warm the active model).
-    try:
-        from .orchestrator import get_orchestrator
-
-        orch = get_orchestrator()
-        orch.models = [name]
-        orch._llm_ready = False  # force re-warm on next llm_session
-    except Exception:
-        logger.exception("failed to sync orchestrator models to %s", name)
-
-    logger.info("director plan model set to %s (persist=%s)", name, persist)
+        _write_selections({**selections, selected: name})
+    _override = {**(_override or {}), selected: name}
+    # Synchronize an existing orchestrator without creating GPU machinery merely
+    # to select a remote model. The policy owns all residency operations.
+    from . import orchestrator
+    if selected == settings.llm_provider and orchestrator._orchestrator is not None:
+        orchestrator._orchestrator.models = [name] if name else []
+        orchestrator._orchestrator._llm_ready = False
     return name
 
 
 def clear_director_model_override(*, remove_persisted: bool = False) -> str:
-    """Fall back to .env default (and optional delete of data/director_model.json)."""
     global _override
-    _override = None
+    selected = _provider()
     if remove_persisted:
-        path = _persist_path()
-        if path.is_file():
-            path.unlink()
+        selections, _ = _read_selections()
+        selections.pop(selected, None)
+        _write_selections(selections)
+    _override = {key: value for key, value in (_override or {}).items() if key != selected}
     return get_director_model()
-
-
-def model_status() -> dict[str, Any]:
-    return {
-        "model": get_director_model(),
-        "override": _override,
-        "persisted": _read_persisted(),
-        "env_default": settings.director_plan_model,
-        "source": (
-            "runtime"
-            if _override
-            else ("persisted" if _read_persisted() else "env")
-        ),
-    }

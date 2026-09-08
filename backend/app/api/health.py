@@ -1,8 +1,10 @@
 from fastapi import APIRouter
 
+from ..config import settings
 from ..core.comfy import ComfyClient
+from ..core.llm import get_llm_provider, public_llm_error
 from ..core.schemas import HealthResponse
-from ..core.vram.ollama_client import OllamaClient
+from .director import _public_error
 
 router = APIRouter(tags=["system"])
 
@@ -21,17 +23,39 @@ async def health() -> HealthResponse:
     try:
         details = await ComfyClient().health()
         comfy_ok = True
-    except Exception as e:
-        comfy_error = str(e)
+    except Exception as exc:
+        comfy_error = _public_error(exc, "Comfy health check")
 
-    ollama_reachable = await OllamaClient().health()
+    llm_reachable = False
+    llm_model_available = False
+    llm_model = None
+    llm_error = None
+    try:
+        provider = get_llm_provider()
+        available = await provider.list_models()
+        llm_reachable = True
+        llm_model = provider.model_status().get("model") or ""
+        llm_model_available = bool(llm_model and llm_model in available)
+        if not llm_model:
+            llm_error = "No Director model selected. Select a model in the Director picker."
+        elif not llm_model_available:
+            llm_error = (
+                f"Selected Director model {llm_model!r} is not served by provider "
+                f"{provider.provider_id!r}."
+            )
+    except Exception as exc:
+        llm_error = public_llm_error(exc)
 
     return HealthResponse(
-        ok=True,
+        ok=comfy_ok and llm_model_available,
         comfy_reachable=comfy_ok,
         comfy_error=comfy_error,
         details={
             "comfy": details.get("system", {}) if details else {},
-            "ollama_reachable": ollama_reachable,
+            "llm_provider": settings.llm_provider,
+            "llm_reachable": llm_reachable,
+            "llm_model": llm_model,
+            "llm_model_available": llm_model_available,
+            "llm_error": llm_error,
         },
     )

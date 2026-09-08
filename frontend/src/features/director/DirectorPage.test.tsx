@@ -13,6 +13,7 @@ import {
   getDirectorVramStatus,
   getProject,
   queueRefFrame,
+  setDirectorModel,
 } from "./api";
 
 const projectState = vi.hoisted(() => ({
@@ -55,10 +56,7 @@ vi.mock("./api", () => ({
   cancelDirectorChatSession: vi.fn(),
   getDirectorChatHistory: getDirectorChatHistoryMock,
   getDirectorChatSession: vi.fn(),
-  getDirectorModel: vi.fn().mockResolvedValue({
-    model: "qwen3.6:27b",
-    available: ["qwen3.6:27b"],
-  }),
+  getDirectorModel: vi.fn(),
   getDirectorVramStatus: vi.fn(),
   getProject: vi.fn(),
   queueRefFrame: vi.fn(),
@@ -113,6 +111,14 @@ describe("Director shot actions", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(chatWithDirectorStream).mockReset();
+    vi.mocked(setDirectorModel).mockReset();
+    vi.mocked(getDirectorModel).mockReset().mockResolvedValue({
+      model: "qwen3.6:27b",
+      provider: "ollama",
+      reachable: true,
+      available: ["qwen3.6:27b"],
+      capabilities: { vision: true, vision_reason: "Verified image support." },
+    });
     Element.prototype.scrollIntoView = vi.fn();
     projectState.projectId = "prj_test";
     projectState.project = {
@@ -256,6 +262,177 @@ describe("Director shot actions", () => {
       screen.getByText("I will preserve the warm lighting across the shots."),
     ).toBeTruthy();
     expect(screen.queryByText(/Working on \*\*Test project\*\*/)).toBeNull();
+  });
+
+  it("keeps a blank model selection and enables its picker before chat", async () => {
+    const catalog = {
+      model: "",
+      provider: "openai_compatible",
+      reachable: true,
+      available: ["kasari-brain", "kasari-flash"],
+      capabilities: { vision: false, vision_reason: "No model selected." },
+    };
+    vi.mocked(getDirectorModel).mockResolvedValueOnce(catalog);
+    vi.mocked(setDirectorModel).mockResolvedValueOnce({
+      ...catalog,
+      model: "kasari-flash",
+      capabilities: { vision: true, vision_reason: "Verified image support." },
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    const picker = screen.getByRole("combobox") as HTMLSelectElement;
+    expect(picker.value).toBe("");
+    expect(picker.disabled).toBe(false);
+    expect(screen.getByRole("option", { name: "Select a model" })).toBeTruthy();
+    expect(screen.getByText(/No Director model selected/, { selector: ".banner" })).toBeTruthy();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(true);
+    expect(setDirectorModel).not.toHaveBeenCalled();
+
+    fireEvent.change(picker, { target: { value: "kasari-flash" } });
+    await waitFor(() => expect(picker.value).toBe("kasari-flash"));
+    expect(setDirectorModel).toHaveBeenCalledExactlyOnceWith("kasari-flash", true);
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  it("shows catalog failures and leaves chat blocked until an explicit refresh succeeds", async () => {
+    vi.mocked(getDirectorModel).mockResolvedValueOnce({
+      model: "kasari-brain",
+      provider: "openai_compatible",
+      reachable: false,
+      available: [],
+      error: "Model catalog request failed: HTTP 401 from LiteLLM /v1/models.",
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    expect(screen.getByText("Model catalog request failed: HTTP 401 from LiteLLM /v1/models.", { selector: ".banner" })).toBeTruthy();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(true);
+    expect((screen.getByRole("combobox") as HTMLSelectElement).disabled).toBe(true);
+    expect(setDirectorModel).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh models" }));
+    await waitFor(() => expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false));
+    expect(getDirectorModel).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the specific model-catalog network error instead of swallowing it", async () => {
+    vi.mocked(getDirectorModel).mockRejectedValueOnce(new Error("Connection refused by LiteLLM"));
+    render(<DirectorPage />);
+
+    expect(await screen.findByText("Could not load Director models: Connection refused by LiteLLM", { selector: ".banner" })).toBeTruthy();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(true);
+  });
+
+  it("preserves an unserved selected model and keeps the picker usable to correct it", async () => {
+    vi.mocked(getDirectorModel).mockResolvedValueOnce({
+      model: "kasari-v4flash",
+      provider: "openai_compatible",
+      reachable: true,
+      available: ["kasari-brain", "kasari-flash"],
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    expect(screen.getByText(/Selected model kasari-v4flash is not served/, { selector: ".banner" })).toBeTruthy();
+    expect((screen.getByRole("combobox") as HTMLSelectElement).value).toBe("kasari-v4flash");
+    expect((screen.getByRole("combobox") as HTMLSelectElement).disabled).toBe(false);
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(true);
+    expect(setDirectorModel).not.toHaveBeenCalled();
+  });
+
+  it("disables unsupported visual actions with a reason while allowing text planning", async () => {
+    const reason = "kasari-brain rejects image input on this provider.";
+    vi.mocked(getDirectorModel).mockResolvedValueOnce({
+      model: "kasari-brain",
+      provider: "openai_compatible",
+      reachable: true,
+      available: ["kasari-brain"],
+      capabilities: { vision: false, vision_reason: reason },
+    });
+    vi.mocked(chatWithDirectorStream).mockResolvedValueOnce({
+      reply: "A real text shot plan", actions: [], project: projectState.project!,
+      shots: [testShot], images: [], thinking: "", steps: [],
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    expect(screen.getByText(`Visual direction and layout analysis are unavailable: ${reason}`)).toBeTruthy();
+    expect((screen.getByLabelText("Add images") as HTMLInputElement).disabled).toBe(true);
+    for (const name of ["Generate references", "Generate reference frame", "Edit materials"]) {
+      const control = screen.getByRole("button", { name }) as HTMLButtonElement;
+      expect(control.disabled).toBe(true);
+      expect(control.title).toBe(reason);
+    }
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Plan shots" }));
+    expect(await screen.findByText("A real text shot plan")).toBeTruthy();
+    expect(chatWithDirectorStream).toHaveBeenCalledExactlyOnceWith(
+      "prj_test", "plan", expect.any(Array), expect.any(Object), [], expect.any(AbortSignal),
+    );
+    expect(queueRefFrame).not.toHaveBeenCalled();
+  });
+
+  it("does not infer image support when a selected model has no verified capability", async () => {
+    vi.mocked(getDirectorModel).mockResolvedValueOnce({
+      model: "unverified-model",
+      provider: "openai_compatible",
+      reachable: true,
+      available: ["unverified-model"],
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    expect(screen.getByText(/Visual direction and layout analysis are unavailable: Image support has not been verified for unverified-model/)).toBeTruthy();
+    expect((screen.getByLabelText("Add images") as HTMLInputElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Plan shots" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("preserves attached images and blocks sending when the model changes to text-only", async () => {
+    const catalog = {
+      model: "kasari-flash",
+      provider: "openai_compatible",
+      reachable: true,
+      available: ["kasari-brain", "kasari-flash"],
+      capabilities: { vision: true, vision_reason: "Verified image support." },
+    };
+    vi.mocked(getDirectorModel).mockResolvedValueOnce(catalog);
+    vi.mocked(setDirectorModel).mockResolvedValueOnce({
+      ...catalog,
+      model: "kasari-brain",
+      capabilities: { vision: false, vision_reason: "kasari-brain rejects image input." },
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+    const file = new File(["image-data"], "blocking.png", { type: "image/png" });
+    fireEvent.change(screen.getByLabelText("Add images"), { target: { files: [file] } });
+    fireEvent.change(screen.getByPlaceholderText(/Talk to the Director/), { target: { value: "Check this composition." } });
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "kasari-brain" } });
+
+    await screen.findByText(/Attached images require a model with verified image support/);
+    expect(screen.getByRole("img", { name: "blocking.png" })).toBeTruthy();
+    expect(screen.getByDisplayValue("Check this composition.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.keyDown(screen.getByPlaceholderText(/Talk to the Director/), { key: "Enter" });
+    expect(chatWithDirectorStream).not.toHaveBeenCalled();
+    expect(screen.getByRole("img", { name: "blocking.png" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove blocking.png" }));
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("reports an externally requested visual review as unavailable without submitting it", async () => {
+    vi.mocked(getDirectorModel).mockResolvedValueOnce({
+      model: "kasari-brain", provider: "openai_compatible", reachable: true,
+      available: ["kasari-brain"],
+      capabilities: { vision: false, vision_reason: "kasari-brain rejects image input." },
+    });
+    render(<DirectorPage requestedMessage={{
+      id: "material-review-1", projectId: "prj_test", message: "Inspect the changed Picture references.", requiresVision: true,
+    }} />);
+
+    expect(await screen.findByText(/Cannot start the requested visual review: kasari-brain rejects image input/)).toBeTruthy();
+    expect(chatWithDirectorStream).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false);
   });
 
   it("replaces Send with Cancel and disables the composer during a local response", async () => {
@@ -518,6 +695,41 @@ describe("Director shot actions", () => {
     expect(screen.getByRole("img", { name: "blocking.png" })).toBeTruthy();
     expect(container.querySelectorAll(".chat-bubble.user")).toHaveLength(0);
     expect(screen.queryByText(/Something went wrong/)).toBeNull();
+  });
+
+  it.each([
+    { status: "queued", phase: "queued", label: "Queued" },
+    { status: "uploading", phase: "uploading", label: "Uploading assets" },
+    { status: "running", phase: "generating", label: "Generating video" },
+  ] as const)("keeps Director chat usable during a 90-minute remote $status reservation", async ({ status, phase, label }) => {
+    vi.mocked(getDirectorVramStatus).mockResolvedValue({
+      chat_locked: false,
+      generation_count: 1,
+      generation_jobs: [{
+        job_id: "remote_h3_90_minutes", pipeline_id: "h3_ref2va", kind: "video",
+        status, phase, queued_at: new Date(Date.now() - 90 * 60 * 1000).toISOString(),
+      }],
+    });
+    vi.mocked(chatWithDirectorStream).mockResolvedValueOnce({
+      reply: "We can plan the next scene while the render continues.",
+      actions: [], project: projectState.project!, shots: [testShot], images: [], thinking: "", steps: [],
+    });
+    render(<DirectorPage />);
+    await screen.findByRole("heading", { name: "1. Corridor walk-in" });
+
+    expect(screen.getByText(`${label} · 1:30:00`)).toBeTruthy();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false);
+    expect((screen.getByRole("combobox") as HTMLSelectElement).disabled).toBe(false);
+    fireEvent.change(screen.getByPlaceholderText(/Talk to the Director/), { target: { value: "Plan the next scene." } });
+    expect((screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    expect(await screen.findByText("We can plan the next scene while the render continues.")).toBeTruthy();
+    expect(chatWithDirectorStream).toHaveBeenCalledExactlyOnceWith(
+      "prj_test", "Plan the next scene.", expect.any(Array), expect.any(Object), [], expect.any(AbortSignal),
+    );
+    expect(screen.getByText(`${label} · 1:30:00`)).toBeTruthy();
+    expect((screen.getByPlaceholderText(/Talk to the Director/) as HTMLTextAreaElement).disabled).toBe(false);
   });
 
   it("marks the desktop workspace to fill the available page height", async () => {

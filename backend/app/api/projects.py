@@ -1,7 +1,7 @@
 """Projects / Shots HTTP API — dual human gates + H3 Ref2AV submit.
 
 Human approve/reject/edit/submit paths work with the LLM cold.
-Gate 1 (layout approve) defaults to ``rewrite_prompt=false`` so no Ollama wake
+Gate 1 (layout approve) defaults to ``rewrite_prompt=false`` so no LLM request
 is required; pass ``?rewrite_prompt=true`` (or body flag) to fill PromptSections
 via DirectorService (may take time while the LLM loads).
 """
@@ -93,7 +93,7 @@ from ..core.projects.transitions import (
 )
 from ..core.schemas import JobStatus, LibraryAsset
 from ..core.vram import GenerationActiveError
-from ..core.vram.ollama_client import OllamaClient
+from ..core.llm import LLMProviderError, get_llm_provider
 
 logger = logging.getLogger("director_studio.api.projects")
 _background_chat_tasks: set[Any] = set()
@@ -145,7 +145,10 @@ def _generation_active_http(error: GenerationActiveError) -> HTTPException:
 async def _assert_chat_available() -> None:
     from ..core.vram import get_orchestrator
 
-    reservations = await get_orchestrator().generation_reservations()
+    orch = get_orchestrator()
+    if not orch.shared_gpu_enabled:
+        return
+    reservations = await orch.generation_reservations()
     if reservations:
         raise GenerationActiveError(reservations)
 
@@ -222,7 +225,7 @@ class ApproveLayoutBody(BaseModel):
     """Optional body for layout approve.
 
     rewrite_prompt: when true, wakes LLM and rewrites six-section prompt
-    (slow / requires Ollama). Default is false (cold path).
+    (requires the selected LLM). Default is false (cold path).
     """
 
     rewrite_prompt: bool | None = None
@@ -272,21 +275,15 @@ class SubmitResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class OllamaPlanProvider:
-    """Production PlanProvider backed by local Ollama."""
+class DirectorPlanProvider:
+    """Plan and repair requests stay on one explicitly selected provider/model."""
 
     def __init__(self, model: str | None = None) -> None:
-        # Optional fixed model (tests); otherwise always use live runtime selection.
-        self._fixed_model = model
-        self.client = OllamaClient()
-
-    @property
-    def model(self) -> str:
-        if self._fixed_model:
-            return self._fixed_model
         from ..core.vram.director_model import get_director_model
 
-        return get_director_model()
+        self.provider = get_llm_provider()
+        self.client = self.provider.client
+        self.model = model if model is not None else get_director_model()
 
     async def complete(
         self,
@@ -306,6 +303,9 @@ class OllamaPlanProvider:
         images: list[str],
         guides: Iterable[str] = (),
     ) -> str:
+        capability = self.provider.capabilities(self.model)
+        if not capability["vision"]:
+            raise LLMProviderError(capability["vision_reason"])
         prompt = with_director_skill(f"{system}\n\n{user}", guides=guides)
         return await self.client.chat(
             self.model,
@@ -320,7 +320,7 @@ def get_director_service(request: Request) -> DirectorService:
     svc = getattr(request.app.state, "director_service", None)
     if svc is not None:
         return svc
-    return DirectorService(plan_provider=OllamaPlanProvider())
+    return DirectorService(plan_provider=DirectorPlanProvider())
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +563,9 @@ async def _make_chat_fn(on_progress=None):
     from ..core.vram.director_model import get_director_model
 
     orch = get_orchestrator()
+    provider = get_llm_provider()
+    client = provider.client
+    plan_model = get_director_model()
 
     async def chat_fn(
         system: str,
@@ -572,11 +575,10 @@ async def _make_chat_fn(on_progress=None):
     ) -> str | dict:
         guides = tuple(_kwargs.get("guides") or ())
         system = with_director_skill(system, guides=guides)
-        # When images are present, keep system separate for /api/chat.
-        # Text-only keeps the combined prompt for /api/generate compatibility.
+        # Keep image messages and their system instructions separate.
         use_images = list(images or [])
         prompt = user if use_images else f"{system}\n\n{user}"
-        # Multi-turn residency: keep Ollama loaded unless DS_LLM_KEEP_LOADED=false
+        # Residency options only affect the explicit shared-GPU policy.
         keep = bool(getattr(settings, "llm_keep_loaded", True))
 
         async def _runtime(text: str) -> None:
@@ -588,9 +590,8 @@ async def _make_chat_fn(on_progress=None):
             on_status=_runtime,
             fail_if_generation_pending=True,
         ):
-            # Always (re)load / verify GPU residency after Comfy may have unloaded it
+            # Verify provider availability; independent mode performs no GPU handoff.
             await orch.ensure_llm_ready(on_status=_runtime)
-            plan_model = get_director_model()
             if use_images:
                 label = f"Thinking with {plan_model} · {len(use_images)} image{'s' if len(use_images) != 1 else ''}…"
             else:
@@ -600,6 +601,16 @@ async def _make_chat_fn(on_progress=None):
             require_vision = bool(_kwargs.get("require_vision"))
             provided_messages = _kwargs.get("messages")
             response_format = _kwargs.get("format")
+            has_message_images = any(
+                item.get("images") or (
+                    isinstance(item.get("content"), list)
+                    and any(part.get("type") == "image_url" for part in item["content"] if isinstance(part, dict))
+                ) for item in (provided_messages or [])
+            )
+            if use_images or require_vision or has_message_images:
+                capability = provider.capabilities(plan_model)
+                if not capability["vision"]:
+                    raise LLMProviderError(capability["vision_reason"])
             forced_tool_name = ""
             forced_tool_schema: dict | None = None
             if len(tools) == 1 and provided_messages is None:
@@ -622,7 +633,7 @@ async def _make_chat_fn(on_progress=None):
                     }
 
             # Function calling, tool-result turns, and schema-constrained output
-            # all use Ollama's native chat API. Ordinary text chat can continue
+            # use the selected provider's chat API. Ordinary text chat continues
             # through the streaming generate path below.
             if (
                 tools
@@ -648,35 +659,13 @@ async def _make_chat_fn(on_progress=None):
                     messages and messages[0].get("role") == "system"
                 ):
                     messages.insert(0, {"role": "system", "content": system})
-                try:
-                    result = await orch.ollama.chat_response(
-                        plan_model,
-                        messages=messages,
-                        tools=None if forced_tool_schema is not None else tools or None,
-                        format=forced_tool_schema or response_format,
-                        require_vision=require_vision or bool(use_images),
-                    )
-                except Exception as exc:
-                    if (
-                        "XML syntax error" not in str(exc)
-                        or provided_messages is not None
-                        or use_images
-                        or not tools
-                    ):
-                        raise
-                    await _runtime(
-                        "Native tool formatting failed; retrying once with the text tool protocol…"
-                    )
-                    fallback_prompt = (
-                        f"{system}\n\n{user}\n\n"
-                        "AVAILABLE_TOOLS_JSON:\n"
-                        f"{json.dumps(tools, ensure_ascii=False)}\n\n"
-                        "Return the requested state-changing action as one fenced JSON "
-                        'object shaped exactly like {"tool":"tool_name","params":{...}}. '
-                        "Do not claim the action succeeded; the application will validate "
-                        "and execute it."
-                    )
-                    return await orch.ollama.generate(plan_model, fallback_prompt)
+                result = await client.chat_response(
+                    plan_model,
+                    messages=messages,
+                    tools=None if forced_tool_schema is not None else tools or None,
+                    format=forced_tool_schema or response_format,
+                    require_vision=require_vision or bool(use_images),
+                )
                 if on_progress:
                     if result.get("thinking"):
                         await on_progress(
@@ -689,51 +678,48 @@ async def _make_chat_fn(on_progress=None):
                 return result
 
             # Prefer streaming so UI can show tokens live
-            if on_progress and hasattr(orch.ollama, "generate_stream"):
+            if on_progress:
                 parts: list[str] = []
                 think_buf: list[str] = []
                 in_think = False
-                try:
-                    async for chunk in orch.ollama.generate_stream(
-                        plan_model,
-                        prompt,
-                        images=use_images or None,
-                        system=system if use_images else None,
-                    ):
-                        kind = chunk.get("kind") if isinstance(chunk, dict) else "token"
-                        text = (
-                            chunk.get("text")
-                            if isinstance(chunk, dict)
-                            else str(chunk)
-                        ) or ""
-                        if not text:
-                            continue
-                        if kind == "think":
-                            think_buf.append(text)
-                            await on_progress({"type": "think", "text": text})
-                            continue
-                        # Detect inline <think> tags while streaming tokens
-                        parts.append(text)
-                        lower = text.lower()
-                        if "<think" in lower:
-                            in_think = True
-                        if in_think:
-                            await on_progress({"type": "think", "text": text})
-                        else:
-                            await on_progress({"type": "token", "text": text})
-                        if "</think" in lower or "</thinking" in lower:
-                            in_think = False
-                    raw = "".join(parts)
-                    if think_buf and "<think>" not in raw.lower():
-                        raw = f"<think>{''.join(think_buf)}</think>\n{raw}"
-                    return raw
-                except Exception:
-                    logger.exception("stream generate failed; falling back to non-stream")
+                async for chunk in client.generate_stream(
+                    plan_model,
+                    prompt,
+                    images=use_images or None,
+                    system=system if use_images else None,
+                ):
+                    kind = chunk.get("kind") if isinstance(chunk, dict) else "token"
+                    text = (
+                        chunk.get("text")
+                        if isinstance(chunk, dict)
+                        else str(chunk)
+                    ) or ""
+                    if not text:
+                        continue
+                    if kind == "think":
+                        think_buf.append(text)
+                        await on_progress({"type": "think", "text": text})
+                        continue
+                    # Detect inline <think> tags while streaming tokens
+                    parts.append(text)
+                    lower = text.lower()
+                    if "<think" in lower:
+                        in_think = True
+                    if in_think:
+                        await on_progress({"type": "think", "text": text})
+                    else:
+                        await on_progress({"type": "token", "text": text})
+                    if "</think" in lower or "</thinking" in lower:
+                        in_think = False
+                raw = "".join(parts)
+                if think_buf and "<think>" not in raw.lower():
+                    raw = f"<think>{''.join(think_buf)}</think>\n{raw}"
+                return raw
             if use_images:
-                return await orch.ollama.chat(
-                    plan_model, user, system=system, images=use_images
+                return await client.chat(
+                    plan_model, user, system=system, images=use_images, require_vision=True
                 )
-            return await orch.ollama.generate(plan_model, prompt)
+            return await client.generate(plan_model, prompt)
 
     return chat_fn
 
@@ -1390,7 +1376,7 @@ async def approve_ref_frame_endpoint(
 ) -> Shot:
     """Gate 1: approve layout reference-frame.
 
-    Default ``rewrite_prompt=false`` — no Ollama required.
+    Default ``rewrite_prompt=false`` — no LLM required.
     Set query/body ``rewrite_prompt=true`` to call write_prompts_after_layout
     (may take time while the LLM loads).
     """

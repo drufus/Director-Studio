@@ -22,6 +22,7 @@ function materialReviewRequest(
     id: `material-review-${shot.id}-${sequence}`,
     projectId: shot.project_id,
     message: materialReviewMessage(shot, shotNumber),
+    requiresVision: true,
   };
 }
 

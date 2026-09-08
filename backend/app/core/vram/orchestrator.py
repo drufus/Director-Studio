@@ -62,11 +62,11 @@ class ComfyFreeClient(Protocol):
 
 class VramOrchestrator:
     """
-    Exclusive GPU ownership between Ollama (LLM) and ComfyUI jobs.
+    Coordinate local GPU ownership, or track independent remote workloads.
 
-    Contended acquires **queue** (wait) instead of failing immediately.
-    - Before Comfy: wait for free GPU, unload Ollama, set owner=comfy
-    - Before LLM: wait for free GPU, unload Comfy models via POST /free, set owner=llm
+    Exclusive policy queues competing Ollama and ComfyUI work and unloads
+    models when ownership changes. Independent policy keeps generation
+    reservations for status without acquiring a shared GPU or evicting models.
     """
 
     def __init__(
@@ -78,7 +78,13 @@ class VramOrchestrator:
         policy: str = "exclusive",
         acquire_timeout_sec: float | None = None,
     ) -> None:
-        self.ollama = ollama or OllamaClient()
+        if policy not in {"exclusive", "independent"}:
+            raise ValueError("VRAM policy must be 'exclusive' or 'independent'")
+        self.policy = policy
+        # Remote inference must not create or contact a local Ollama client.
+        self.ollama = ollama
+        if self.shared_gpu_enabled and self.ollama is None:
+            self.ollama = OllamaClient()
         self.comfy = comfy  # lazy default via _get_comfy if None
         if models is not None:
             self.models = list(models)
@@ -86,7 +92,6 @@ class VramOrchestrator:
             from .director_model import get_director_model
 
             self.models = [get_director_model()]
-        self.policy = policy or "exclusive"
         self.acquire_timeout_sec = (
             acquire_timeout_sec
             if acquire_timeout_sec is not None
@@ -101,6 +106,11 @@ class VramOrchestrator:
         self._generation_reservations: dict[str, GenerationReservation] = {}
         self.last_comfy_free: dict | None = None
         self.last_comfy_free_error: str | None = None
+
+    @property
+    def shared_gpu_enabled(self) -> bool:
+        """Whether LLM and generation share one GPU and admission lock."""
+        return self.policy == "exclusive"
 
     def _generation_snapshot_unlocked(self) -> list[GenerationReservation]:
         return sorted(
@@ -170,6 +180,8 @@ class VramOrchestrator:
 
     async def release_llm(self) -> None:
         """Unload configured Ollama models (best-effort)."""
+        if not self.shared_gpu_enabled:
+            return
         # Always unload the *current* director model + any previously tracked names.
         from .director_model import get_director_model
 
@@ -184,8 +196,11 @@ class VramOrchestrator:
         """
         Unload ComfyUI image/video models and free VRAM.
 
-        Always attempted before Plan/LLM so image models do not stay resident.
+        Automatic eviction only applies to the exclusive shared GPU policy.
+        ``require_ok`` controls error propagation, not policy enforcement.
         """
+        if not self.shared_gpu_enabled:
+            return None
         try:
             stats = await self._get_comfy().free_memory(
                 unload_models=True, free_memory=True
@@ -237,14 +252,40 @@ class VramOrchestrator:
 
     async def ensure_llm_ready(self, on_status=None) -> None:
         """
-        Health-check Ollama and warm the primary plan model if needed.
+        Validate remote model availability, or warm a local Ollama model.
 
-        Must run inside an active llm_session (owner=="llm").
-        Forces GPU offload (num_gpu) and logs if model ends up on CPU only.
+        Exclusive policy requires an active llm_session (owner=="llm") and
+        forces GPU offload. Independent policy verifies the selected model
+        against its provider catalog without probing or changing GPU residency.
 
         ``on_status`` is an optional async callable(str) for UI progress
         (e.g. "Loading ornith:35b onto the GPU…").
         """
+        if not self.shared_gpu_enabled:
+            from ..llm import LLMProviderError, get_llm_provider
+            from .director_model import get_director_model
+
+            self._llm_ready = False
+            model = get_director_model()
+            if not model:
+                raise LLMProviderError(
+                    "No Director model selected; select a model before planning"
+                )
+            provider = get_llm_provider()
+            served_models = await provider.list_models()
+            if model not in served_models:
+                raise LLMProviderError(
+                    f"Director model {model!r} is not served by provider "
+                    f"{provider.provider_id!r}; select an available model"
+                )
+            self.models = [model]
+            self._llm_ready = True
+            if on_status is not None:
+                result = on_status(f"{model} available on {provider.provider_id}")
+                if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                    await result
+            return
+
         if self.owner == "comfy":
             raise GPUBusyError("comfy")
         if self.owner != "llm":
@@ -329,6 +370,8 @@ class VramOrchestrator:
         unloads Ollama** so image/video generation owns VRAM. Next chat/plan
         reloads the LLM via ensure_llm_ready.
         """
+        if not self.shared_gpu_enabled:
+            return
         async with self._cv:
             await self._wait_until_free(want=f"comfy:{pipeline_id}")
             # Always try unload — residency may have left weights in VRAM.
@@ -352,6 +395,8 @@ class VramOrchestrator:
 
     async def after_comfy_job(self, pipeline_id: str, terminal_status: str) -> None:
         """Release Comfy ownership, free Comfy models, wake queue waiters."""
+        if not self.shared_gpu_enabled:
+            return
         async with self._cv:
             if self.owner == "comfy" and (
                 self.comfy_pipeline is None or self.comfy_pipeline == pipeline_id
@@ -390,6 +435,11 @@ class VramOrchestrator:
 
         on_status: optional async/sync callable(str) for UI while waiting / freeing.
         """
+        if not self.shared_gpu_enabled:
+            # Per-project chat admission belongs to the Director lifecycle. A
+            # remote render reservation cannot block an unrelated LLM session.
+            yield self
+            return
 
         async def _status(msg: str) -> None:
             logger.info("llm_session: %s", msg)
@@ -454,7 +504,6 @@ def get_orchestrator() -> VramOrchestrator:
         from .director_model import get_director_model
 
         _orchestrator = VramOrchestrator(
-            ollama=OllamaClient(),
             models=[get_director_model()],
             policy=settings.vram_policy,
         )

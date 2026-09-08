@@ -83,6 +83,7 @@ function ReferenceThumb({ refItem, onOpen }: { refItem: ShotRef; onOpen: (url: s
 export function ShotWorkspace({
   shots,
   busy,
+  visualDisabledReason,
   onRegenerate,
   onSend,
   onSelectShot,
@@ -91,6 +92,7 @@ export function ShotWorkspace({
 }: {
   shots: Shot[];
   busy: boolean;
+  visualDisabledReason?: string;
   onRegenerate: (shot: Shot) => void;
   onSend: (message: string) => void;
   onSelectShot?: (shot: Shot) => void;
@@ -216,7 +218,8 @@ export function ShotWorkspace({
                       <button
                         type="button"
                         className="mode-chip shot-material-edit-trigger"
-                        disabled={busy}
+                        disabled={busy || Boolean(visualDisabledReason)}
+                        title={visualDisabledReason}
                         onClick={() => setMaterialEditorOpen(true)}
                       >
                         Edit materials
@@ -241,10 +244,12 @@ export function ShotWorkspace({
                     <span>03 / Visual studies</span>
                     <h4>Layout studies</h4>
                   </header>
+                  {visualDisabledReason ? <p className="muted">{visualDisabledReason}</p> : null}
                   {selected.layout_refs.length ? (
                     <LayoutReferenceList
                       shot={selected}
                       busy={busy}
+                      visualDisabledReason={visualDisabledReason}
                       onDiscussAddReference={(description) => {
                         const ids = selected.layout_refs.map((layout) => layout.id).join(", ") || "none";
                         onSend(
@@ -264,7 +269,8 @@ export function ShotWorkspace({
                       <button
                         type="button"
                         className="mode-chip"
-                        disabled={busy || (selected.status === "ref_frame_pending" && Boolean(selected.ref_frame_job_id))}
+                        disabled={busy || Boolean(visualDisabledReason) || (selected.status === "ref_frame_pending" && Boolean(selected.ref_frame_job_id))}
+                        title={visualDisabledReason}
                         onClick={() => onRegenerate(selected)}
                       >
                         Generate reference frame

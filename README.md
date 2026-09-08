@@ -2,9 +2,9 @@
 
 Local-first pre-production workspace for planning shots, managing reusable visual and voice assets, writing MiniMax H3 Ref2AV prompts, and generating media through ComfyUI.
 
-Director Studio keeps the planning Agent local through Ollama. Image and local video workflows run in ComfyUI through ComfyUI MCP; H3 video can alternatively be submitted to the official MiniMax API.
+Director Studio runs the planning agent through a configured OpenAI-compatible provider (including LiteLLM) or local Ollama. Image and local video workflows run in ComfyUI through ComfyUI MCP; H3 video can alternatively be submitted to the official MiniMax API.
 
-Core features include a typed asset library, actor and set workflows, conversational shot planning, editable Picture and Audio references, optional Layout studies, six-section H3 prompts, local/cloud video submission, durable jobs, and exclusive Ollama/ComfyUI VRAM coordination.
+Core features include a typed asset library, actor and set workflows, conversational shot planning, editable Picture and Audio references, optional Layout studies, six-section H3 prompts, local/cloud video submission, durable jobs, and independent or exclusive GPU coordination.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source layout and extension points.
 
@@ -12,14 +12,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the source layout and exten
 
 | Layer | Tech |
 |-------|------|
-| Backend | FastAPI · pluggable pipelines · ComfyUI MCP · Ollama Director |
+| Backend | FastAPI · pluggable pipelines · ComfyUI MCP · pluggable Director LLM |
 | Frontend | Vite + React · feature folders |
 | Execution | ComfyUI through MCP (actor / scene / prop / Layout / local H3) · MiniMax H3 official API |
-| Planning LLM | Local Ollama (exclusive VRAM with Comfy) |
+| Planning LLM | OpenAI-compatible/LiteLLM or local Ollama |
 
 ## Native macOS and Linux setup
 
-The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The ongoing cluster port is staged: this setup is Phase 1; LiteLLM inference, independent GPU coordination, remote worker routing, and systemd deployment follow in separate changes. The existing inference code still uses Ollama and Comfy MCP at this stage.
+The native launch path supports macOS and Linux, including ARM64 Linux. It runs the API and built browser UI in one foreground process. The cluster port is staged: native startup and LiteLLM planning with independent GPU coordination are implemented. Remote worker routing and systemd deployment follow in separate changes; Comfy execution still uses the legacy MCP transport. Configure remote planning using [LLM provider settings](docs/LLM-PROVIDERS.md).
 
 Install Python 3.11+ (3.12 recommended), Node.js 22.12+ with npm, and FFmpeg/ffprobe on `PATH`. On macOS, Homebrew can provide `python@3.12`, `node@22`, and `ffmpeg`; follow its instructions to put the selected executables on `PATH`. On Ubuntu/DGX OS, install `python3-venv`, `python3-pip`, and `ffmpeg`, plus a supported Node.js version.
 
@@ -47,7 +47,7 @@ The portable package runs Director Studio locally as one `DirectorStudio.exe`. T
   ollama pull <model-name>
   ```
 
-  Director reads the installed catalog from Ollama. With no saved selection it uses the first installed model; with no installed models it leaves the selection empty.
+  Director reads the installed catalog from Ollama. Select a model explicitly in the picker; an empty selection remains empty. Image features require an explicitly verified model in `DS_LLM_VISION_MODELS`.
 
 - [ComfyUI Desktop for Windows](https://docs.comfy.org/installation/desktop/windows), running at `http://127.0.0.1:8188`.
 - Python 3.10 or newer for the external Comfy command-line tools. Director Studio itself does not require a separate Python installation.
@@ -82,7 +82,7 @@ DS_H3_PROVIDER=minimax
 DS_H3_MINIMAX_API_KEY=your-secret-key
 ```
 
-Director Studio always coordinates local generation and Ollama with its built-in exclusive GPU lock. VRAM policy, queue timeout, and LLM residency use internal defaults and require no user configuration.
+Local Ollama defaults to the exclusive GPU policy. OpenAI-compatible providers default to independent mode, which permits Director conversations during renders and performs no automatic model eviction. See [LLM configuration](docs/LLM-PROVIDERS.md).
 
 Do not publish `.env`; it may contain provider credentials. Projects and generated application state are stored in the adjacent `data` folder. Back up that folder before replacing or upgrading the package.
 
@@ -401,12 +401,18 @@ API: `/api/actors/*` · `GET /api/pipelines`
 | `DS_PORT` | `8790` | API port |
 | `DS_RELOAD` | `false` | Explicit backend reload for source development |
 | `DS_DATA_DIR` | repository `data/` | Persistent application storage root |
+| `DS_LLM_PROVIDER` | `ollama` | `ollama` or `openai_compatible` |
+| `DS_LLM_BASE_URL` | empty | OpenAI API root, e.g. LiteLLM URL ending in `/v1` |
+| `DS_LLM_API_KEY` | empty | Private runtime credential; never commit it |
+| `DS_LLM_MODEL` | empty | Explicit initial model, overridden by provider-scoped picker selection |
+| `DS_LLM_VISION_MODELS` | empty | CSV of exact IDs verified for image input on this endpoint |
+| `DS_VRAM_POLICY` | provider-dependent | `independent` for OpenAI-compatible; `exclusive` for local Ollama |
 | `DS_OLLAMA_BASE_URL` | `http://127.0.0.1:11434` | Local Ollama for Director |
 | `DS_H3_MINIMAX_API_KEY` | empty | MiniMax API credential when `DS_H3_PROVIDER=minimax` |
 | `DS_H3_MINIMAX_MODEL` | `MiniMax-H3` | MiniMax H3 API model |
 | `DS_H3_MINIMAX_RESOLUTION` | `768P` | Requested MiniMax API output resolution |
 
-The Director model is not an environment default. Director Studio discovers the installed Ollama catalog, selects the first installed model when no prior choice exists, and persists subsequent model-picker selections under `data/director_model.json`. If Ollama has no models, the selection remains empty.
+Director Studio discovers models from the selected provider and persists explicit picker selections under `data/director_model.json`, separately for each provider. Blank selections stay blank. Catalog failures and removed models are visible and block inference. See [provider setup and capabilities](docs/LLM-PROVIDERS.md).
 
 For source development, set values in `backend/.env` (prefix `DS_`). In the portable package, use the `.env` beside `DirectorStudio.exe`.
 

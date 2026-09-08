@@ -43,6 +43,13 @@ describe("generation status formatting", () => {
     ).toBe("Generating video · 02:37 · 2 jobs waiting");
   });
 
+  it("keeps remote generation visible when chat is unlocked", () => {
+    expect(generationStatusText(
+      { ...status, chat_locked: false },
+      new Date("2026-08-31T11:30:00Z"),
+    )).toBe("Generating video · 1:30:00 · 2 jobs waiting");
+  });
+
   it("formats every runtime phase", () => {
     const labels = (["queued", "uploading", "saving"] as const).map((phase) =>
       generationStatusText(
