@@ -14,9 +14,8 @@ fail() {
 [[ -x "$VENV_DIR/bin/python" ]] || fail 'the Python environment is missing.'
 [[ -f "$ROOT/frontend/dist/index.html" ]] || fail 'the browser interface has not been built.'
 
-# MCP child processes locate comfy-mcp and comfy through PATH until the remote
-# HTTP transport is implemented. pydantic-settings reads .env as data; never
-# execute it as shell code. Exported DS_* settings retain their normal priority.
+# Use the dedicated Python environment. pydantic-settings reads .env as data;
+# never execute it as shell code. Exported DS_* settings retain their priority.
 export VIRTUAL_ENV="$VENV_DIR"
 export PATH="$VENV_DIR/bin:$PATH"
 export PYTHONUNBUFFERED=1

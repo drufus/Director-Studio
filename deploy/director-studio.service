@@ -1,0 +1,23 @@
+[Unit]
+Description=Kasari Director Studio
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=damienrufus
+Group=damienrufus
+WorkingDirectory=/opt/kasari/director-studio
+EnvironmentFile=/opt/kasari/config/director-studio.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStartPre=/usr/bin/test -x /usr/bin/ffmpeg
+ExecStartPre=/usr/bin/test -x /usr/bin/ffprobe
+ExecStart=/opt/kasari/director-studio/start.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/opt/kasari/logs/director-studio.log
+StandardError=append:/opt/kasari/logs/director-studio.log
+
+[Install]
+WantedBy=multi-user.target
