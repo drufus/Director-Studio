@@ -17,7 +17,7 @@ from ...core.h3.prompt import (
     validate_required_picture_bindings,
 )
 from ...core.library.audio import probe_audio
-from ...core.schemas import ComfyImageRef, JobRecord
+from ...core.schemas import ComfyImageRef, JobRecord, JobStatus
 from ...workflow_profiles.h3 import (
     H3ProfileStore,
     ResolvedH3Profile,
@@ -149,6 +149,10 @@ class H3Ref2VaPipeline(Pipeline):
         expected_hash = params.get("h3_profile_sha256")
         expected_contract = params.get("h3_contract_version")
         if not expected_id and not expected_hash and expected_contract is None:
+            # Pure graph-building helpers may inspect the fresh selection before
+            # submission; executing/recovered jobs must use their original bytes.
+            if job.status not in {JobStatus.queued, JobStatus.uploading} or job.comfy_prompt_id or job.worker_id or job.worker_url:
+                raise ValueError("H3 execution job is missing its original workflow snapshot")
             return resolve_active_h3_profile()
         profile = load_job_profile_snapshot(job.id)
         if (
@@ -158,6 +162,11 @@ class H3Ref2VaPipeline(Pipeline):
             raise ValueError("H3 job profile snapshot does not match its job record")
         if expected_contract != 2:
             raise ValueError("H3 job profile snapshot contract version is unsupported")
+        if profile.source == "custom" and params.get("h3_eligible_workers") != [worker.model_dump(mode="json") for worker in profile.eligible_workers]:
+            raise ValueError("H3 job worker eligibility does not match its immutable profile snapshot")
+        if profile.source == "custom" and (job.worker_id is not None or job.worker_url is not None):
+            if not any(worker.worker_id == job.worker_id and worker.worker_url == job.worker_url for worker in profile.eligible_workers):
+                raise ValueError("H3 job worker has no validation and test evidence for its workflow snapshot")
         return profile
 
     @staticmethod

@@ -16,6 +16,7 @@ from app.workflow_profiles.h3 import (
     H3OutputSelection,
     H3ProfileStore,
     H3WorkflowProfile,
+    H3WorkerBinding,
     ProfileStorageError,
 )
 
@@ -132,6 +133,42 @@ def _valid_workflow() -> dict[str, object]:
     }
 
 
+WORKER = H3WorkerBinding(worker_id="worker-a", worker_url="http://worker-a:8188")
+
+
+def worker_evidence(
+    workflow_sha256, mapping_sha256, *, worker=WORKER, job_id="job_store_fixture"
+):
+    binding = worker.model_dump(mode="json")
+    inspection = {
+        "worker": binding,
+        "workflow_sha256": workflow_sha256,
+        "metadata_sha256": "a" * 64,
+        "binding_generation": "a" * 32,
+    }
+    validation = {
+        "worker": binding,
+        "inspection": inspection,
+        "valid": True,
+        "contract_version": 2,
+        "workflow_sha256": workflow_sha256,
+        "mapping_sha256": mapping_sha256,
+        "report": {"valid": True},
+        "comfy": {"valid": True, "metadata_sha256": "a" * 64},
+    }
+    test = {
+        "worker": binding,
+        "status": "succeeded",
+        "metadata_sha256": "a" * 64,
+        "binding_generation": "a" * 32,
+        "contract_version": 2,
+        "workflow_sha256": workflow_sha256,
+        "mapping_sha256": mapping_sha256,
+        "job_id": job_id,
+    }
+    return validation, test
+
+
 def _install_custom_profile(
     store: H3ProfileStore,
     workflow: dict[str, object] | None = None,
@@ -150,21 +187,7 @@ def _install_custom_profile(
         status=status,
     )
     mapping_sha256 = store.mapping_sha256(profile.mapping)
-    evidence = {
-        "valid": True,
-        "contract_version": 2,
-        "workflow_sha256": profile.workflow_sha256,
-        "mapping_sha256": mapping_sha256,
-        "report": {"valid": True},
-        "comfy": {"valid": True},
-    }
-    test_record = {
-        "status": "succeeded",
-        "contract_version": 2,
-        "workflow_sha256": profile.workflow_sha256,
-        "mapping_sha256": mapping_sha256,
-        "job_id": "job_store_fixture",
-    }
+    evidence, test_record = worker_evidence(profile.workflow_sha256, mapping_sha256)
     store.install_profile(
         profile,
         workflow,
@@ -189,6 +212,8 @@ def test_fresh_store_resolves_builtin_official(
 
     resolved = H3ProfileStore().resolve_active()
 
+    assert resolved.selection_source == "initial_default"
+    assert "initial default" in resolved.selection_message
     assert resolved.profile_id == "builtin-official-h3"
     assert resolved.source == "builtin"
     assert resolved.workflow_sha256
@@ -205,17 +230,16 @@ def test_active_pointer_rejects_path_traversal(
         store.select_profile("../outside")
 
 
-def test_changed_custom_workflow_falls_back_to_builtin(
+def test_changed_custom_workflow_fails_with_requested_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = installed_custom_store(tmp_path, monkeypatch)
     store.workflow_path("custom").write_text("{}", encoding="utf-8")
 
-    resolved = store.resolve_active()
-
-    assert resolved.source == "builtin"
-    assert resolved.warning is not None
-    assert resolved.warning.code == "profile_changed"
+    with pytest.raises(
+        ProfileStorageError, match="Selected H3 profile.*custom.*Stored workflow"
+    ):
+        store.resolve_active()
 
 
 def test_custom_profile_round_trips_utf8_bom_workflow(
@@ -245,6 +269,11 @@ def test_custom_profile_round_trips_utf8_bom_workflow(
         separators=(",", ":"),
     ).encode("utf-8")
     evidence["profile_sha256"] = hashlib.sha256(profile_bytes).hexdigest()
+    for proof in evidence["worker_proofs"]:
+        proof["workflow_sha256"] = profile.workflow_sha256
+        proof["inspection"]["workflow_sha256"] = profile.workflow_sha256
+        proof["test"]["workflow_sha256"] = profile.workflow_sha256
+        proof["profile_sha256"] = evidence["profile_sha256"]
     evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
     store.select_profile("custom")
 
@@ -304,7 +333,7 @@ def test_select_profile_rejects_custom_profile_without_durable_evidence(
         store.select_profile("custom")
 
 
-def test_resolve_active_falls_back_when_pointer_targets_untested_profile(
+def test_resolve_active_rejects_pointer_targeting_untested_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = isolated_store(tmp_path, monkeypatch)
@@ -320,11 +349,10 @@ def test_resolve_active_falls_back_when_pointer_targets_untested_profile(
         encoding="utf-8",
     )
 
-    resolved = store.resolve_active()
-
-    assert resolved.source == "builtin"
-    assert resolved.warning is not None
-    assert resolved.warning.code == "profile_unavailable"
+    with pytest.raises(
+        ProfileStorageError, match="Selected H3 profile.*custom.*tested or active"
+    ):
+        store.resolve_active()
 
 
 @pytest.mark.parametrize(

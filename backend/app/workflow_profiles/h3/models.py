@@ -14,6 +14,25 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class H3WorkerBinding(_StrictModel):
+    """An exact render-worker identity; an ID alone is never sufficient proof."""
+
+    worker_id: StrictStr = Field(pattern=r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+    worker_url: StrictStr = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_endpoint(self) -> H3WorkerBinding:
+        from app.core.comfy.client import ComfyError, validate_base_url
+
+        try:
+            canonical = validate_base_url(self.worker_url)
+        except ComfyError as exc:
+            raise ValueError(str(exc)) from exc
+        if canonical != self.worker_url:
+            raise ValueError("Worker URL must be canonical without a trailing slash")
+        return self
+
+
 class H3InputMapping(_StrictModel):
     """Application-owned inputs on an otherwise workflow-owned graph."""
 
@@ -57,6 +76,7 @@ class H3WorkflowProfile(_StrictModel):
     workflow_sha256: StrictStr = Field(pattern=r"[0-9a-f]{64}")
     mapping: H3BoundaryMapping
     status: Literal["draft", "mapped", "validated", "tested", "active", "broken"]
+    eligible_workers: tuple[H3WorkerBinding, ...] = ()
 
 
 class H3AnalysisIssue(_StrictModel):
@@ -142,3 +162,7 @@ class ResolvedH3Profile:
     warning: ProfileWarning | None = None
     display_name: str = "Custom H3 workflow"
     validated_at: str | None = None
+    eligible_workers: tuple[H3WorkerBinding, ...] = ()
+    worker_proofs: tuple[dict[str, Any], ...] = ()
+    selection_source: Literal["initial_default", "explicit"] = "explicit"
+    selection_message: str | None = None

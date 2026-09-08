@@ -8,17 +8,20 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictStr
+from pydantic import BaseModel, ConfigDict, Field, StrictStr, model_validator
 
-from ..core.comfy.client import ComfyError
+from ..core.comfy.client import ComfyError, workflow_metadata_sha256, validate_base_url
 from ..core.comfy.workers import get_worker_registry
 from ..core.jobs import create_job, start_pipeline_job
+from ..core.jobs import store as job_store
+from ..core.schemas import JobStatus
 from ..core.library.images import resolve_asset_image
 from ..core.library.store import asset_dir, load_asset
 from ..core.paths import LIBRARY_KINDS
 from ..pipelines.h3_ref2va.workflow import fill_profile_graph
 from ..workflow_profiles.h3 import (
     H3BoundaryMapping,
+    H3WorkerBinding,
     H3ProfileStore,
     ProfileChangedError,
     ProfileStateError,
@@ -45,11 +48,23 @@ class SelectOutputRequest(_StrictModel):
 
 class TestProfileRequest(_StrictModel):
     worker_id: StrictStr = Field(min_length=1)
+    worker_url: StrictStr = Field(min_length=1)
     picture_asset_id: StrictStr = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     audio_asset_id: StrictStr | None = Field(
         default=None,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
     )
+
+
+class BindWorkerRequest(_StrictModel):
+    worker_id: StrictStr | None
+    worker_url: StrictStr | None
+
+    @model_validator(mode="after")
+    def paired_identity(self):
+        if (self.worker_id is None) != (self.worker_url is None):
+            raise ValueError("worker_id and worker_url must both be set or both be null")
+        return self
 
 
 class SelectTestOutputRequest(_StrictModel):
@@ -143,6 +158,9 @@ def _active_payload(store: H3ProfileStore) -> dict[str, Any]:
         "workflow_sha256": resolved.workflow_sha256,
         "contract_version": 2,
         "validated_at": resolved.validated_at,
+        "eligible_workers": [worker.model_dump(mode="json") for worker in resolved.eligible_workers],
+        "selection_source": resolved.selection_source,
+        "selection_message": resolved.selection_message,
         "warning": (
             {
                 "code": resolved.warning.code,
@@ -158,7 +176,16 @@ def _active_payload(store: H3ProfileStore) -> dict[str, Any]:
 @router.get("")
 def list_h3_profiles() -> dict[str, Any]:
     store = H3ProfileStore()
-    active = _active_payload(store)
+    active_error = None
+    selected_profile_id = None
+    try:
+        active = _active_payload(store)
+        selected_profile_id = active["profile_id"]
+    except ProfileStorageError as exc:
+        active = None
+        details = exc.details if isinstance(exc, ProfileStateError) else {}
+        selected_profile_id = details.get("profile_id")
+        active_error = {"code": exc.code if isinstance(exc, ProfileStateError) else "selected_profile_unavailable", "message": str(exc), "details": details}
     profiles: list[dict[str, Any]] = [
         {
             "profile_id": "builtin-official-h3",
@@ -166,7 +193,7 @@ def list_h3_profiles() -> dict[str, Any]:
             "source": "builtin",
             "status": (
                 "active"
-                if active["profile_id"] == "builtin-official-h3"
+                if active and active["profile_id"] == "builtin-official-h3"
                 else "available"
             ),
             "workflow_sha256": store.resolve_builtin().workflow_sha256,
@@ -182,11 +209,12 @@ def list_h3_profiles() -> dict[str, Any]:
                 "profile_id": profile.id,
                 "display_name": resolved.display_name,
                 "source": "custom",
-                "status": "active" if profile.id == active["profile_id"] else "tested",
+                "status": "active" if active and profile.id == active["profile_id"] else "tested",
+                "eligible_workers": [worker.model_dump(mode="json") for worker in resolved.eligible_workers],
                 "workflow_sha256": profile.workflow_sha256,
             }
         )
-    return {"active": active, "profiles": profiles}
+    return {"active": active, "active_error": active_error, "selected_profile_id": selected_profile_id, "profiles": profiles}
 
 
 @router.post("/imports", status_code=201, response_model=None)
@@ -250,11 +278,50 @@ async def import_h3_workflow(
     }
 
 
-async def _worker_object_info(worker_id: str) -> dict[str, Any]:
+def _configured_worker(worker_id: str, worker_url: str):
+    """Resolve the exact browser-observed endpoint before any worker request."""
     try:
-        return await get_worker_registry().client_for(worker_id).get_object_info()
+        expected_url = validate_base_url(worker_url)
+        client = get_worker_registry().client_for(worker_id)
+    except ComfyError as exc:
+        raise ProfileStateError("worker_unavailable", str(exc), details={"worker_id": worker_id}) from exc
+    if client.base_url != expected_url:
+        raise ProfileStateError("worker_changed", f"Worker {worker_id!r} now points to a different endpoint. Select its current address and inspect again", details={"worker_id": worker_id, "expected_url": expected_url, "configured_url": client.base_url})
+    return H3WorkerBinding(worker_id=worker_id, worker_url=client.base_url), client
+
+
+def _bound_worker(store: H3ProfileStore, import_id: str, worker_id: str, worker_url: str):
+    worker, client = _configured_worker(worker_id, worker_url)
+    store.require_import_worker(import_id, worker)
+    return worker, client
+
+
+@router.put("/imports/{import_id:path}/worker", response_model=None)
+def bind_h3_import_worker(import_id: str, body: BindWorkerRequest):
+    store = H3ProfileStore()
+    try:
+        worker = None
+        if body.worker_id is not None:
+            worker, _client = _configured_worker(body.worker_id, body.worker_url)
+        binding = store.bind_import_worker(import_id, worker)
+        return {"worker": binding.model_dump(mode="json") if binding else None, "lifecycle": store.import_lifecycle(import_id)}
+    except ProfileStorageError as exc:
+        return _store_error(exc)
+
+
+async def _inspect_import_metadata(store: H3ProfileStore, import_id: str, worker_id: str, worker_url: str):
+    worker, client = _bound_worker(store, import_id, worker_id, worker_url)
+    binding_generation = store.import_binding_generation(import_id)
+    graph, workflow_hash = store.load_import_workflow_snapshot(import_id)
+    try:
+        object_info = await client.get_object_info()
     except ComfyError as exc:
         raise HTTPException(503, str(exc)) from None
+    _bound_worker(store, import_id, worker_id, worker_url)
+    store.record_inspection(import_id, worker, workflow_sha256=workflow_hash,
+                            metadata_sha256=workflow_metadata_sha256(graph, object_info),
+                            expected_binding_generation=binding_generation)
+    return graph, object_info
 
 
 def _analysis_payload(
@@ -274,13 +341,13 @@ def _analysis_payload(
 
 
 @router.get("/imports/{import_id:path}/analysis", response_model=None)
-async def analyze_h3_import(import_id: str, worker_id: str) -> dict[str, Any] | JSONResponse:
+async def analyze_h3_import(import_id: str, worker_id: str, worker_url: str) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
-        graph = store.load_import_workflow(import_id)
+        graph, object_info = await _inspect_import_metadata(store, import_id, worker_id, worker_url)
         analysis = inspect_h3_workflow(
             graph,
-            object_info=await _worker_object_info(worker_id),
+            object_info=object_info,
             output_node_id=store.load_import_output(import_id),
         )
         return _analysis_payload(store, import_id, analysis)
@@ -295,11 +362,11 @@ async def select_h3_import_output(
     import_id: str,
     body: SelectOutputRequest,
     worker_id: str,
+    worker_url: str,
 ) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
-        graph = store.load_import_workflow(import_id)
-        object_info = await _worker_object_info(worker_id)
+        graph, object_info = await _inspect_import_metadata(store, import_id, worker_id, worker_url)
         unselected = inspect_h3_workflow(graph, object_info=object_info)
         if body.node_id not in {
             candidate.node_id for candidate in unselected.output_candidates
@@ -327,9 +394,12 @@ async def select_h3_import_output(
 def save_h3_import_mapping(
     import_id: str,
     body: H3BoundaryMapping,
+    worker_id: str,
+    worker_url: str,
 ) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
+        _bound_worker(store, import_id, worker_id, worker_url)
         selected_output = store.load_import_output(import_id)
         if selected_output is None or body.output.node_id != selected_output:
             return _error(
@@ -358,9 +428,11 @@ def save_h3_import_mapping(
 
 
 @router.post("/imports/{import_id:path}/validate", response_model=None)
-async def validate_h3_import(import_id: str, worker_id: str) -> dict[str, Any] | JSONResponse:
+async def validate_h3_import(import_id: str, worker_id: str, worker_url: str) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
+        worker, client = _bound_worker(store, import_id, worker_id, worker_url)
+        binding_generation = store.import_binding_generation(import_id)
         graph, workflow_sha256 = store.load_import_workflow_snapshot(import_id)
         mapping = store.load_import_mapping(import_id)
         if mapping is None:
@@ -419,8 +491,18 @@ async def validate_h3_import(import_id: str, worker_id: str) -> dict[str, Any] |
         return _store_error(exc)
 
     try:
-        client = get_worker_registry().client_for(worker_id)
-        comfy_payload = await client.validate_workflow(filled)
+        metadata = await client.get_object_info()
+        _bound_worker(store, import_id, worker_id, worker_url)
+        metadata_sha256 = workflow_metadata_sha256(graph, metadata)
+        store.record_inspection(
+            import_id,
+            worker,
+            workflow_sha256=workflow_sha256,
+            metadata_sha256=metadata_sha256,
+            expected_binding_generation=binding_generation,
+        )
+        comfy_payload = await client.validate_workflow(filled, object_info=metadata)
+        comfy_payload["metadata_sha256"] = metadata_sha256
     except ComfyError as exc:
         return _error(
             422,
@@ -428,14 +510,19 @@ async def validate_h3_import(import_id: str, worker_id: str) -> dict[str, Any] |
             str(exc),
             {"import_id": import_id},
         )
+    except ProfileStorageError as exc:
+        return _store_error(exc)
 
     try:
+        _bound_worker(store, import_id, worker_id, worker_url)
         record = store.record_validation_success(
             import_id,
             workflow_sha256=workflow_sha256,
             mapping_sha256=mapping_sha256,
             report=report.model_dump(mode="json"),
             comfy_payload=comfy_payload,
+            worker=worker,
+            expected_binding_generation=binding_generation,
         )
     except ProfileStorageError as exc:
         return _store_error(exc)
@@ -455,12 +542,9 @@ async def test_h3_import(
     body: TestProfileRequest,
 ) -> dict[str, Any] | JSONResponse:
     """Start an isolated remote test against a validated, unactivated import."""
-    try:
-        get_worker_registry().client_for(body.worker_id)
-    except ComfyError as exc:
-        return _error(422, "worker_unavailable", str(exc))
     store = H3ProfileStore()
     try:
+        _bound_worker(store, import_id, body.worker_id, body.worker_url)
         workflow_sha256, mapping_sha256 = store.testable_import_identity(import_id)
         mapping = store.load_import_mapping(import_id)
     except ProfileStorageError as exc:
@@ -507,6 +591,7 @@ async def test_h3_import(
             "h3_provider": "local",
             "h3_profile_test": True,
             "worker_id": body.worker_id,
+            "worker_url": validate_base_url(body.worker_url),
             "h3_profile_import_id": import_id,
             "h3_profile_test_workflow_sha256": workflow_sha256,
             "h3_profile_test_mapping_sha256": mapping_sha256,
@@ -523,10 +608,13 @@ async def test_h3_import(
         fixed_seed=True,
     )
     try:
+        store.record_test_submission(import_id, job)
         await start_pipeline_job(job, images=inputs)
     except ProfileStorageError as exc:
+        _fail_unstarted_test(job.id, exc)
         return _store_error(exc)
     except (TypeError, ValueError) as exc:
+        _fail_unstarted_test(job.id, exc)
         return _error(
             422,
             "test_job_invalid",
@@ -543,14 +631,25 @@ async def test_h3_import(
     }
 
 
+def _fail_unstarted_test(job_id: str, exc: Exception) -> None:
+    job = job_store.load_job(job_id)
+    if job is not None and job.status == JobStatus.queued:
+        job.status = JobStatus.failed
+        job.error = f"Job preparation failed: {exc}"
+        job_store.save_job(job)
+
+
 @router.put("/imports/{import_id:path}/test-output", response_model=None)
 def select_h3_test_output(
     import_id: str,
     body: SelectTestOutputRequest,
+    worker_id: str,
+    worker_url: str,
 ) -> dict[str, Any] | JSONResponse:
     """Choose one already-generated setup-test video without rerunning Comfy."""
     store = H3ProfileStore()
     try:
+        _bound_worker(store, import_id, worker_id, worker_url)
         record = store.select_test_output(import_id, body.artifact_index)
     except ProfileStorageError as exc:
         return _store_error(exc)
@@ -564,10 +663,22 @@ def select_h3_test_output(
 
 
 @router.post("/imports/{import_id:path}/activate", response_model=None)
-def activate_h3_import(import_id: str) -> dict[str, Any] | JSONResponse:
+async def activate_h3_import(import_id: str, worker_id: str, worker_url: str) -> dict[str, Any] | JSONResponse:
     store = H3ProfileStore()
     try:
+        _worker, client = _bound_worker(store, import_id, worker_id, worker_url)
+        binding_generation = store.import_binding_generation(import_id)
+        await client.health()
+        _bound_worker(store, import_id, worker_id, worker_url)
+        if store.import_binding_generation(import_id) != binding_generation:
+            raise ProfileChangedError(
+                "Render worker binding changed during activation; select the worker again"
+            )
         profile = store.activate_import(import_id)
+    except ComfyError as exc:
+        return _error(
+            503, "worker_unavailable", str(exc), {"worker_id": worker_id}
+        )
     except ProfileStorageError as exc:
         return _store_error(exc)
     return {

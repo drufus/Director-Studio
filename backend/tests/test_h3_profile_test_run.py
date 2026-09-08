@@ -15,6 +15,7 @@ from PIL import Image
 
 from app.config import settings
 from app.core.comfy import ComfyError
+from app.core.comfy.client import workflow_metadata_sha256
 from app.core.jobs.execution_adapters.comfy import (
     ComfyExecutionAdapter,
     ComfyExecutionRuntime,
@@ -35,12 +36,18 @@ from app.main import create_app
 from app.pipelines.h3_ref2va.pipeline import H3Ref2VaPipeline
 from app.workflow_profiles.h3 import (
     H3ProfileStore,
+    H3WorkerBinding,
     ProfileChangedError,
     ProfileStateError,
     ProfileStorageError,
     load_job_profile_snapshot,
 )
 from app.workflow_profiles.h3.inspector import inspect_h3_workflow
+
+
+WORKER_URL = "http://remote-worker:8188"
+WORKER = H3WorkerBinding(worker_id="beastviii", worker_url=WORKER_URL)
+METADATA = {}
 
 
 def _picture_png() -> bytes:
@@ -70,7 +77,7 @@ def test_test_route_preparation_race_persists_failed_job(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id},
+            json={"worker_id": "beastviii", "worker_url": WORKER_URL, "picture_asset_id": actor_picture.id},
         )
     assert response.status_code == 409
     jobs = list_jobs()
@@ -94,12 +101,15 @@ def _import_ready_profile(store: H3ProfileStore) -> str:
     workflow_sha256, mapping_sha256 = store.import_identity(import_id)
     mapping = store.load_import_mapping(import_id)
     assert mapping is not None
+    store.bind_import_worker(import_id, WORKER)
+    store.record_inspection(import_id, WORKER, workflow_sha256=store.import_workflow_sha256(import_id), metadata_sha256=workflow_metadata_sha256(graph, METADATA))
     store.record_validation_success(
         import_id,
+        worker=WORKER,
         workflow_sha256=workflow_sha256,
         mapping_sha256=mapping_sha256,
         report={"valid": True, "issues": [], "fixed_dependencies": []},
-        comfy_payload={"valid": True, "error_count": 0, "warnings": []},
+        comfy_payload={"valid": True, "error_count": 0, "warnings": [], "metadata_sha256": workflow_metadata_sha256(graph, METADATA)},
     )
     return import_id
 
@@ -124,6 +134,8 @@ def _profile_test_job(store: H3ProfileStore, import_id: str):
         name="profile adapter test",
         params={
             "h3_provider": "local",
+            "worker_id": "beastviii",
+            "worker_url": WORKER_URL,
             "h3_profile_test": True,
             "h3_profile_import_id": import_id,
             "h3_profile_test_workflow_sha256": workflow_sha256,
@@ -189,6 +201,11 @@ def test_linked_test_job_metadata_cannot_authorize_activation(
 
 
 class _CompletedTestClient:
+    base_url = WORKER_URL
+
+    async def get_object_info(self):
+        return METADATA
+
     def __init__(
         self,
         cancel_event: asyncio.Event | None = None,
@@ -322,7 +339,7 @@ def test_test_run_creates_isolated_56_frame_remote_h3_job(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id, "audio_asset_id": None},
+            json={"worker_id": "beastviii", "worker_url": WORKER_URL, "picture_asset_id": actor_picture.id, "audio_asset_id": None},
         )
 
     assert response.status_code == 202, response.text
@@ -383,6 +400,7 @@ def test_test_run_resolves_optional_voice_asset(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
             json={
                 "worker_id": "beastviii",
+                "worker_url": WORKER_URL,
                 "picture_asset_id": actor_picture.id,
                 "audio_asset_id": voice_asset.id,
             },
@@ -396,7 +414,7 @@ def test_test_run_resolves_optional_voice_asset(
     assert captured_inputs["audio_1"] == ("reference.wav", b"RIFF-test-voice")
 
 
-@pytest.mark.parametrize("worker_fields", [{}, {"worker_id": "unknown-worker"}])
+@pytest.mark.parametrize("worker_fields", [{}, {"worker_id": "unknown-worker", "worker_url": "http://unknown-worker:8188"}])
 def test_remote_test_requires_a_configured_explicit_worker(
     test_env, actor_picture, worker_fields
 ):
@@ -408,7 +426,7 @@ def test_remote_test_requires_a_configured_explicit_worker(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
             json={"picture_asset_id": actor_picture.id, **worker_fields},
         )
-    assert response.status_code == 422
+    assert response.status_code == (409 if worker_fields else 422)
     if worker_fields:
         assert response.json()["code"] == "worker_unavailable"
         assert "unknown-worker" in response.json()["message"]
@@ -503,6 +521,7 @@ def test_activation_rejects_evidence_for_non_succeeded_job(
         json.dumps(
             {
                 "status": "succeeded",
+                "worker": WORKER.model_dump(mode="json"),
                 "contract_version": 2,
                 "workflow_sha256": workflow_sha256,
                 "mapping_sha256": mapping_sha256,
@@ -537,7 +556,7 @@ async def test_mapped_test_video_records_same_identity_and_allows_activation(
     with TestClient(create_app()) as client:
         response = client.post(
             f"/api/workflow-profiles/h3/imports/{import_id}/test",
-            json={"worker_id": "beastviii", "picture_asset_id": actor_picture.id},
+            json={"worker_id": "beastviii", "worker_url": WORKER_URL, "picture_asset_id": actor_picture.id},
         )
 
     job = load_job(response.json()["job_id"])
@@ -642,7 +661,7 @@ async def test_selecting_observed_test_video_does_not_rerun_and_allows_activatio
 
     with TestClient(create_app()) as client:
         response = client.put(
-            f"/api/workflow-profiles/h3/imports/{import_id}/test-output",
+            f"/api/workflow-profiles/h3/imports/{import_id}/test-output?worker_id=beastviii&worker_url={WORKER_URL}",
             json={"artifact_index": 1},
         )
 
@@ -679,15 +698,18 @@ def test_test_result_for_old_hash_cannot_activate(test_env: Path) -> None:
     graph["136"]["inputs"]["prompt"] = "changed after the test"
     workflow_path.write_text(json.dumps(graph), encoding="utf-8")
     new_workflow_sha256, current_mapping_sha256 = store.import_identity(import_id)
+    store.bind_import_worker(import_id, WORKER)
+    store.record_inspection(import_id, WORKER, workflow_sha256=store.import_workflow_sha256(import_id), metadata_sha256=workflow_metadata_sha256(graph, METADATA))
     store.record_validation_success(
         import_id,
+        worker=WORKER,
         workflow_sha256=new_workflow_sha256,
         mapping_sha256=current_mapping_sha256,
         report={"valid": True},
-        comfy_payload={"valid": True},
+        comfy_payload={"valid": True, "metadata_sha256": workflow_metadata_sha256(graph, METADATA)},
     )
 
-    with pytest.raises(ProfileChangedError, match="successful test"):
+    with pytest.raises(ProfileStateError, match="successful test"):
         store.activate_import(import_id)
 
 

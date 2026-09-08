@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
 import ipaddress
-import re
+import json
 import mimetypes
+import re
 import time
 import uuid
 from collections.abc import Callable
+from copy import deepcopy
 from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -96,6 +98,59 @@ def _relative_path(value: Any, *, allow_empty: bool = False) -> str:
     return value
 
 
+def workflow_metadata_sha256(graph: dict[str, Any], metadata: dict[str, Any]) -> str:
+    """Hash graph dependencies without uploaded-file lists that change on every test."""
+    classes = sorted({node.get("class_type") for node in graph.values() if isinstance(node, dict) and isinstance(node.get("class_type"), str)})
+    relevant = {}
+    for class_name in classes:
+        schema = deepcopy(metadata.get(class_name))
+        if isinstance(schema, dict):
+            schema = {key: schema.get(key) for key in ("input", "output", "output_node")}
+            filename = {"LoadImage": "image", "LoadAudio": "audio"}.get(class_name)
+            if filename:
+                for group in ("required", "optional"):
+                    fields = (schema.get("input") or {}).get(group, {})
+                    if filename in fields:
+                        fields[filename] = ["UPLOADED_FILE"]
+        relevant[class_name] = schema
+    return hashlib.sha256(json.dumps(relevant, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _workflow_input_fields(groups: dict[str, Any], inputs: dict[str, Any], prefix: str = ""):
+    """Expand the flattened V3 input names exposed by ComfyUI's API exporter.
+
+    Autogrow's container is not itself an input. Its template defines the first
+    required names; DynamicCombo contributes the chosen option's nested fields.
+    This mirrors comfy_api.latest._io's schema expansion without importing a
+    local ComfyUI installation or evaluating node code.
+    """
+    for group in ("required", "optional"):
+        for name, spec in groups.get(group, {}).items():
+            field = f"{prefix}{name}"
+            kind = spec[0] if isinstance(spec, (list, tuple)) and spec else None
+            options = spec[1] if isinstance(spec, (list, tuple)) and len(spec) > 1 and isinstance(spec[1], dict) else {}
+            if kind == "COMFY_AUTOGROW_V3":
+                template = options.get("template", {})
+                names = template.get("names")
+                if names is None:
+                    names = [f"{template['prefix']}{i}" for i in range(template["max"])]
+                template_groups = template.get("input", {})
+                template_fields = [(key, value) for key in ("required", "optional") for value in template_groups.get(key, {}).values()]
+                if not template_fields:
+                    raise ValueError(f"Autogrow input {field!r} has no template input")
+                template_group, template_spec = template_fields[0]
+                for index, child in enumerate(names):
+                    required = template_group == "required" and index < template.get("min", 1)
+                    yield f"{field}.{child}", template_spec, required
+                continue
+            yield field, spec, group == "required"
+            if kind == "COMFY_DYNAMICCOMBO_V3":
+                for option in options.get("options", []):
+                    if inputs.get(field) == option.get("key"):
+                        yield from _workflow_input_fields(option.get("inputs", {}), inputs, f"{field}.")
+                        break
+
+
 class ComfyClient:
     def __init__(self, base_url: str | None = None, *, worker_id: str | None = None,
                  on_failure: Callable[[str], None] | None = None,
@@ -162,9 +217,9 @@ class ComfyClient:
     async def get_object_info(self) -> dict[str, Any]:
         return self._object(await self._request("GET", "/object_info"), "/object_info")
 
-    async def validate_workflow(self, prompt: dict[str, Any]) -> dict[str, Any]:
+    async def validate_workflow(self, prompt: dict[str, Any], *, object_info: dict[str, Any] | None = None) -> dict[str, Any]:
         """Read-only dependency check; execution/custom validators run at /prompt submission."""
-        info = await self.get_object_info()
+        info = await self.get_object_info() if object_info is None else object_info
         errors: list[str] = []
         for node_id, node in prompt.items():
             class_name = node.get("class_type") if isinstance(node, dict) else None
@@ -173,17 +228,26 @@ class ComfyClient:
                 errors.append(f"node {node_id}: class {class_name!r} is not installed")
                 continue
             inputs = node.get("inputs", {})
-            for group in ("required", "optional"):
-                fields = (schema.get("input") or {}).get(group, {})
-                for name, spec in fields.items():
-                    if group == "required" and name not in inputs:
-                        errors.append(f"node {node_id} ({class_name}): required input {name!r} is missing")
-                    value = inputs.get(name)
-                    # Image/audio names are uploaded later. This check verifies model/selector enums.
-                    if name in {"image", "audio"} or isinstance(value, list) or value is None:
-                        continue
-                    if isinstance(spec, (list, tuple)) and spec and isinstance(spec[0], list) and value not in spec[0]:
-                        errors.append(f"node {node_id} ({class_name}): {name}={value!r} is not available on this worker")
+            try:
+                fields = list(_workflow_input_fields(schema.get("input") or {}, inputs))
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"node {node_id} ({class_name}): invalid worker input schema ({type(exc).__name__})")
+                continue
+            for name, spec, required in fields:
+                if required and name not in inputs:
+                    errors.append(f"node {node_id} ({class_name}): required input {name!r} is missing")
+                value = inputs.get(name)
+                # Image/audio names are uploaded later. This check verifies model/selector enums.
+                if name in {"image", "audio"} or isinstance(value, list) or value is None:
+                    continue
+                kind = spec[0] if isinstance(spec, (list, tuple)) and spec else None
+                choices = kind if isinstance(kind, list) else None
+                if kind in ("COMBO", "COMFY_DYNAMICCOMBO_V3") and len(spec) > 1:
+                    choices = spec[1].get("options")
+                    if kind == "COMFY_DYNAMICCOMBO_V3" and choices is not None:
+                        choices = [option["key"] for option in choices]
+                if choices is not None and value not in choices:
+                    errors.append(f"node {node_id} ({class_name}): {name}={value!r} is not available on this worker")
         if errors:
             raise self._error("Workflow dependency validation failed: " + "; ".join(errors))
         return {"valid": True, "validation_scope": "object_info_dependencies", "worker_id": self.worker_id,

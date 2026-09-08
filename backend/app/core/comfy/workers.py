@@ -39,6 +39,25 @@ def parse_workers(value: str) -> list[Worker]:
     return workers
 
 
+def _profile_eligibility(job: Any) -> set[tuple[str, str]] | None:
+    if job.pipeline_id != "h3_ref2va":
+        return None
+    value = job.params.get("h3_eligible_workers")
+    custom = job.params.get("h3_profile_id") not in {None, "builtin-official-h3"}
+    if value is None and not custom:
+        return None
+    if not isinstance(value, list) or not value:
+        if not custom and value == []:
+            return None
+        raise ComfyError(f"H3 profile {job.params.get('h3_profile_id')!r} has no validated worker evidence")
+    pairs: set[tuple[str, str]] = set()
+    for item in value:
+        if not isinstance(item, dict) or not isinstance(item.get("worker_id"), str) or not isinstance(item.get("worker_url"), str):
+            raise ComfyError("H3 profile snapshot contains invalid worker eligibility")
+        pairs.add((item["worker_id"], validate_base_url(item["worker_url"])))
+    return pairs
+
+
 class WorkerRegistry:
     def __init__(self, workers: list[Worker], *, client_factory: Any = ComfyClient) -> None:
         self.workers = {worker.id: worker for worker in workers}
@@ -76,7 +95,10 @@ class WorkerRegistry:
     async def bind_job(self, job: Any, allow_selection: bool = True) -> ComfyClient:
         from ..jobs.store import save_job
         async with self._lock:
+            eligible = _profile_eligibility(job)
             if job.worker_id or job.worker_url:
+                if eligible is not None and (job.worker_id, job.worker_url) not in eligible:
+                    raise ComfyError(f"Job {job.id} worker pin has no matching validation/test evidence for H3 profile {job.params.get('h3_profile_id')!r}")
                 worker = self.workers.get(job.worker_id)
                 if not worker or worker.base_url != job.worker_url:
                     raise ComfyError(f"Job {job.id} is pinned to worker {job.worker_id!r} at {job.worker_url!r}; that exact worker configuration is unavailable. Job will not be rerouted")
@@ -87,10 +109,19 @@ class WorkerRegistry:
                 if not states:
                     raise ComfyError("No render workers configured. Set DS_COMFY_WORKERS explicitly")
                 requested = job.params.get("worker_id")
-                candidates = [s for s in states if s["status"] == "up" and (requested is None or s["id"] == requested)]
+                requested_url = job.params.get("worker_url")
+                if requested_url is not None:
+                    configured = self.workers.get(requested)
+                    if configured is None or configured.base_url != validate_base_url(requested_url):
+                        raise ComfyError(f"Requested render worker {requested!r} changed endpoint or is no longer configured; job will not be rerouted")
+                candidates = [s for s in states if s["status"] == "up"
+                              and (requested is None or s["id"] == requested)
+                              and (eligible is None or (s["id"], s["base_url"]) in eligible)]
                 if not candidates:
                     reasons = "; ".join(f"{s['id']}: {s['error'] or s['status']}" for s in states)
-                    raise ComfyError(f"No eligible render worker{f' matching {requested!r}' if requested else ''}. {reasons}")
+                    raise ComfyError(f"No eligible render worker{f' matching {requested!r}' if requested else ''}"
+                                     + (f" with validation/test evidence for H3 profile {job.params.get('h3_profile_id')!r}" if eligible is not None else "")
+                                     + f". {reasons}")
                 # Rotating tie-break + remote queue load + this process's in-flight claims.
                 order = list(self.workers)
                 rank = {key: (i - self._next) % len(order) for i, key in enumerate(order)}
