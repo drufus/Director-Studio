@@ -9,5 +9,3 @@ aiofiles>=24.1.0
 comfy-cli>=1.19,<2
 comfy-mcp==0.10.0
 Pillow>=10.0.0
-# local tests
-pytest>=8,<10

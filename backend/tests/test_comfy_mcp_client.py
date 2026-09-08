@@ -36,6 +36,7 @@ class FakeToolSession:
         return None
 
 
+@pytest.mark.legacy_windows
 def test_server_parameters_resolve_installed_windows_entrypoints(
     monkeypatch,
     tmp_path,

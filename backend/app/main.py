@@ -68,7 +68,9 @@ def run() -> None:
         app if runtime_paths.frozen else "app.main:app",
         host=settings.host,
         port=settings.port,
-        reload=not runtime_paths.frozen,
+        reload=settings.reload and not runtime_paths.frozen,
+        # The job registry and GPU reservations are owned by this process.
+        workers=1,
     )
 
 

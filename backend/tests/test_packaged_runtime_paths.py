@@ -73,6 +73,7 @@ def _run_script(script: Path, *arguments: str, env: dict[str, str]):
     )
 
 
+@pytest.mark.legacy_windows
 def test_workflow_archive_check_rejects_external_h3_profile_state(tmp_path: Path):
     executable = tmp_path / "DirectorStudio.exe"
     executable.write_bytes(b"fixture")
@@ -92,6 +93,7 @@ def test_workflow_archive_check_rejects_external_h3_profile_state(tmp_path: Path
     assert "workflow_profiles/h3/profiles" in f"{result.stdout}\n{result.stderr}"
 
 
+@pytest.mark.legacy_windows
 def test_h3_archive_check_accepts_official_only_executable_and_zip(tmp_path: Path):
     executable = tmp_path / "DirectorStudio.exe"
     executable.write_bytes(b"same packaged executable")
@@ -111,6 +113,7 @@ def test_h3_archive_check_accepts_official_only_executable_and_zip(tmp_path: Pat
     assert "official H3-only packaging test passed" in result.stdout
 
 
+@pytest.mark.legacy_windows
 def test_h3_archive_check_rejects_external_state_in_zip(tmp_path: Path):
     executable = tmp_path / "DirectorStudio.exe"
     executable.write_bytes(b"same packaged executable")
@@ -130,6 +133,7 @@ def test_h3_archive_check_rejects_external_state_in_zip(tmp_path: Path):
     assert "data" in f"{result.stdout}\n{result.stderr}"
 
 
+@pytest.mark.legacy_windows
 def test_h3_archive_check_rejects_external_data_in_executable(tmp_path: Path):
     executable = tmp_path / "DirectorStudio.exe"
     executable.write_bytes(b"same packaged executable")
@@ -152,6 +156,7 @@ def test_h3_archive_check_rejects_external_data_in_executable(tmp_path: Path):
     assert "data" in f"{result.stdout}\n{result.stderr}"
 
 
+@pytest.mark.legacy_windows
 @pytest.mark.parametrize("script", [WORKFLOW_CHECK, H3_CHECK])
 @pytest.mark.parametrize(
     "wrong_entry",
@@ -184,6 +189,7 @@ def test_archive_checks_reject_non_exact_official_h3_entry(
     assert "workflows/h3_ref2va.api.json" in f"{result.stdout}\n{result.stderr}"
 
 
+@pytest.mark.legacy_windows
 @pytest.mark.parametrize("script", [WORKFLOW_CHECK, H3_CHECK])
 def test_archive_checks_accept_exact_pyinstaller_official_h3_entry(
     tmp_path: Path,

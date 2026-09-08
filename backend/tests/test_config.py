@@ -3,6 +3,14 @@ from pathlib import Path
 from app.config import Settings
 
 
+def test_server_reload_is_opt_in(monkeypatch) -> None:
+    monkeypatch.delenv("DS_RELOAD", raising=False)
+    assert Settings(_env_file=None).reload is False
+
+    monkeypatch.setenv("DS_RELOAD", "true")
+    assert Settings(_env_file=None).reload is True
+
+
 def test_data_dir_derives_all_persistent_subdirectories(tmp_path: Path) -> None:
     data_root = tmp_path / "shared-data"
 

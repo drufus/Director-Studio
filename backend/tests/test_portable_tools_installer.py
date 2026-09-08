@@ -7,7 +7,10 @@ import shutil
 import subprocess
 import sys
 
+import pytest
 from dotenv import dotenv_values
+
+pytestmark = pytest.mark.legacy_windows
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

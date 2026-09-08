@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     comfy_base_url: str = "http://127.0.0.1:8188"
     host: str = "127.0.0.1"
     port: int = 8790
+    reload: bool = False
 
     # Repo root: Director-Studio/
     project_root: Path = _PROJECT_ROOT
